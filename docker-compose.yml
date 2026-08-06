@@ -1,0 +1,26 @@
+services:
+  horizon-dashboard:
+    build: .
+    image: horizon-streamlit-sqlite:local
+    container_name: horizon-streamlit-dashboard
+    init: true
+    ports:
+      - "8502:8501"
+    volumes:
+      - ./data:/app/data
+    environment:
+      PYTHONPATH: /app
+      HORIZON_DB_PATH: /app/data/horizon.sqlite
+      HORIZON_REFRESH_MINUTES: ${HORIZON_REFRESH_MINUTES:-15}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
