@@ -12,6 +12,15 @@ services:
       PYTHONPATH: /app
       HORIZON_DB_PATH: /app/data/horizon.sqlite
       HORIZON_REFRESH_MINUTES: ${HORIZON_REFRESH_MINUTES:-15}
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: 2g
+    mem_reservation: 512m
+    cpus: 2.0
+    pids_limit: 256
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"]

@@ -5,3 +5,4 @@ requests==2.32.3
 streamlit-plotly-events==0.0.6
 feedparser==6.0.11
 pycountry==24.6.1
+websocket-client==1.8.0
