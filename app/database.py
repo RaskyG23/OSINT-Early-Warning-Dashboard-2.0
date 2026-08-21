@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DB_PATH = Path(os.getenv("HORIZON_DB_PATH", "/app/data/horizon.sqlite"))
+DB_PATH = Path(os.getenv("OSINT_DB_PATH", "/app/data/osint-dashboard.sqlite"))
 
 
 @contextmanager
@@ -71,7 +71,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS country_refreshes (
           country TEXT PRIMARY KEY,
           article_count INTEGER NOT NULL DEFAULT 0,
-          format_version INTEGER NOT NULL DEFAULT 3,
+          format_version INTEGER NOT NULL DEFAULT 4,
           collected_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS article_history (
@@ -126,6 +126,13 @@ def init_db():
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           mmsi TEXT NOT NULL,
           ship_name TEXT,
+          vessel_type TEXT,
+          imo TEXT,
+          call_sign TEXT,
+          last_port TEXT,
+          destination TEXT,
+          eta TEXT,
+          draught_m REAL,
           latitude REAL NOT NULL,
           longitude REAL NOT NULL,
           speed_knots REAL,
@@ -145,6 +152,50 @@ def init_db():
           collected_at TEXT NOT NULL, monitor_country TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'OpenSky',
           UNIQUE(icao24, observed_at)
         );
+        CREATE TABLE IF NOT EXISTS article_feedback (
+          profile TEXT NOT NULL,
+          article_key TEXT NOT NULL,
+          country TEXT,
+          headline TEXT NOT NULL,
+          summary TEXT,
+          category TEXT,
+          transport_mode TEXT,
+          feedback INTEGER NOT NULL CHECK(feedback IN (-1, 1)),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(profile, article_key)
+        );
+        CREATE TABLE IF NOT EXISTS country_exposure (
+          profile TEXT NOT NULL,
+          country TEXT NOT NULL,
+          supplier_concentration INTEGER NOT NULL DEFAULT 0 CHECK(supplier_concentration BETWEEN 0 AND 100),
+          goods_value INTEGER NOT NULL DEFAULT 0 CHECK(goods_value BETWEEN 0 AND 100),
+          route_dependency INTEGER NOT NULL DEFAULT 0 CHECK(route_dependency BETWEEN 0 AND 100),
+          inventory_vulnerability INTEGER NOT NULL DEFAULT 0 CHECK(inventory_vulnerability BETWEEN 0 AND 100),
+          customer_exposure INTEGER NOT NULL DEFAULT 0 CHECK(customer_exposure BETWEEN 0 AND 100),
+          substitution_difficulty INTEGER NOT NULL DEFAULT 0 CHECK(substitution_difficulty BETWEEN 0 AND 100),
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(profile, country)
+        );
+        CREATE TABLE IF NOT EXISTS flight_routes (
+          callsign TEXT PRIMARY KEY,
+          airline TEXT,
+          origin_name TEXT,
+          origin_country TEXT,
+          origin_iata TEXT,
+          origin_icao TEXT,
+          origin_latitude REAL,
+          origin_longitude REAL,
+          destination_name TEXT,
+          destination_country TEXT,
+          destination_iata TEXT,
+          destination_icao TEXT,
+          destination_latitude REAL,
+          destination_longitude REAL,
+          source TEXT NOT NULL,
+          status TEXT NOT NULL,
+          checked_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_signals_observed ON signals(observed_at DESC);
         CREATE INDEX IF NOT EXISTS idx_signals_source_severity ON signals(source, severity);
         CREATE INDEX IF NOT EXISTS idx_articles_country_category_date ON country_articles(country, category, published_at DESC);
@@ -155,6 +206,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_vessel_mmsi_time ON vessel_positions(mmsi, observed_at DESC);
         CREATE INDEX IF NOT EXISTS idx_vessel_time ON vessel_positions(observed_at DESC);
         CREATE INDEX IF NOT EXISTS idx_aircraft_country_time ON aircraft_states(monitor_country, observed_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_feedback_profile_time ON article_feedback(profile, updated_at DESC);
         PRAGMA optimize;
         """)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(country_articles)")}
@@ -175,6 +227,19 @@ def init_db():
         vessel_columns = {row[1] for row in conn.execute("PRAGMA table_info(vessel_positions)")}
         if "monitor_country" not in vessel_columns:
             conn.execute("ALTER TABLE vessel_positions ADD COLUMN monitor_country TEXT NOT NULL DEFAULT 'Global strategic waterways'")
+        if "vessel_type" not in vessel_columns:
+            conn.execute("ALTER TABLE vessel_positions ADD COLUMN vessel_type TEXT")
+        for column, definition in (
+            ("imo", "TEXT"), ("call_sign", "TEXT"), ("last_port", "TEXT"),
+            ("destination", "TEXT"), ("eta", "TEXT"), ("draught_m", "REAL"),
+        ):
+            if column not in vessel_columns:
+                conn.execute(f"ALTER TABLE vessel_positions ADD COLUMN {column} {definition}")
+        route_columns = {row[1] for row in conn.execute("PRAGMA table_info(flight_routes)")}
+        if "origin_country" not in route_columns:
+            conn.execute("ALTER TABLE flight_routes ADD COLUMN origin_country TEXT")
+        if "destination_country" not in route_columns:
+            conn.execute("ALTER TABLE flight_routes ADD COLUMN destination_country TEXT")
         pattern_columns = {row[1] for row in conn.execute("PRAGMA table_info(story_patterns)")}
         pattern_additions = {
             "entities_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -233,14 +298,25 @@ def record_run(provider, status, count, message, collected_at):
 def upsert_vessel_positions(records):
     if not records:
         return
+    records = [{**record,
+                "vessel_type": record.get("vessel_type", ""),
+                "imo": record.get("imo", ""), "call_sign": record.get("call_sign", ""),
+                "last_port": record.get("last_port", ""), "destination": record.get("destination", ""),
+                "eta": record.get("eta", ""), "draught_m": record.get("draught_m")}
+               for record in records]
     with connection() as conn:
         conn.executemany("""INSERT INTO vessel_positions
-          (mmsi,ship_name,latitude,longitude,speed_knots,course,heading,observed_at,collected_at,source,monitor_country)
-          VALUES (:mmsi,:ship_name,:latitude,:longitude,:speed_knots,:course,:heading,:observed_at,:collected_at,:source,:monitor_country)
+          (mmsi,ship_name,vessel_type,imo,call_sign,last_port,destination,eta,draught_m,
+           latitude,longitude,speed_knots,course,heading,observed_at,collected_at,source,monitor_country)
+          VALUES (:mmsi,:ship_name,:vessel_type,:imo,:call_sign,:last_port,:destination,:eta,:draught_m,
+           :latitude,:longitude,:speed_knots,:course,:heading,:observed_at,:collected_at,:source,:monitor_country)
           ON CONFLICT(mmsi,observed_at) DO UPDATE SET ship_name=excluded.ship_name,
+          vessel_type=excluded.vessel_type,
+          imo=excluded.imo,call_sign=excluded.call_sign,last_port=excluded.last_port,
+          destination=excluded.destination,eta=excluded.eta,draught_m=excluded.draught_m,
           latitude=excluded.latitude,longitude=excluded.longitude,speed_knots=excluded.speed_knots,
           course=excluded.course,heading=excluded.heading,collected_at=excluded.collected_at,
-          monitor_country=excluded.monitor_country""", records)
+          source=excluded.source,monitor_country=excluded.monitor_country""", records)
         conn.execute("""DELETE FROM vessel_positions WHERE id NOT IN
           (SELECT id FROM vessel_positions ORDER BY observed_at DESC LIMIT 10000)""")
 
@@ -277,12 +353,12 @@ def upsert_aircraft_states(records):
           (SELECT id FROM aircraft_states ORDER BY observed_at DESC LIMIT 10000)""")
 
 
-def latest_aircraft(country, limit=500):
+def latest_aircraft(country=None, limit=500):
     with connection() as conn:
         return [dict(row) for row in conn.execute("""WITH latest AS (
           SELECT aircraft_states.*,ROW_NUMBER() OVER(PARTITION BY icao24 ORDER BY observed_at DESC) aircraft_rank
-          FROM aircraft_states WHERE monitor_country=?
-        ) SELECT * FROM latest WHERE aircraft_rank=1 ORDER BY observed_at DESC LIMIT ?""",(country,limit))]
+          FROM aircraft_states WHERE (? IS NULL OR monitor_country=?)
+        ) SELECT * FROM latest WHERE aircraft_rank=1 ORDER BY observed_at DESC LIMIT ?""",(country,country,limit))]
 
 
 def aircraft_history(icao24, limit=100):
@@ -291,13 +367,37 @@ def aircraft_history(icao24, limit=100):
           "SELECT * FROM aircraft_states WHERE icao24=? ORDER BY observed_at DESC LIMIT ?",(icao24,limit))]
 
 
-def recent_signals(limit_per_source=100):
+def recent_signals(limit_per_source=100, max_age_days=7):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
     with connection() as conn:
         return [dict(row) for row in conn.execute("""WITH ranked AS (
           SELECT signals.*, ROW_NUMBER() OVER (PARTITION BY source ORDER BY observed_at DESC) AS source_rank
-          FROM signals
+          FROM signals WHERE observed_at >= ?
         )
-        SELECT * FROM ranked WHERE source_rank <= ? ORDER BY observed_at DESC""", (limit_per_source,))]
+        SELECT * FROM ranked WHERE source_rank <= ? ORDER BY observed_at DESC""", (cutoff, limit_per_source))]
+
+
+def current_gdacs_signals(limit=600, presence_grace_hours=3):
+    """Return hazards still present in recent successful GDACS feed snapshots.
+
+    GDACS writes only active events, so an old stored ``iscurrent=true`` value
+    cannot prove that an event is still active. Continued collection presence
+    within a short grace period is the operational freshness test.
+    """
+    with connection() as conn:
+        latest = conn.execute("""SELECT collected_at FROM collection_runs
+          WHERE provider='GDACS' AND status='live' ORDER BY id DESC LIMIT 1""").fetchone()
+        if not latest or not latest[0]:
+            return []
+        try:
+            latest_time = datetime.fromisoformat(latest[0]).astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            return []
+        cutoff = (latest_time - timedelta(hours=presence_grace_hours)).isoformat()
+        return [dict(row) for row in conn.execute("""SELECT * FROM signals
+          WHERE source='GDACS' AND collected_at>=?
+          ORDER BY CASE severity WHEN 'Critical' THEN 3 WHEN 'High' THEN 2 ELSE 1 END DESC,
+                   collected_at DESC LIMIT ?""", (cutoff, limit))]
 
 
 def country_articles(country, category, limit=5):
@@ -321,8 +421,10 @@ def all_country_articles(limit=5000):
 
 def country_cache_fresh(country, max_age_minutes=10):
     with connection() as conn:
-        row = conn.execute("SELECT collected_at,format_version FROM country_refreshes WHERE country=?", (country,)).fetchone()
-    if not row or not row[0] or row[1] < 3:
+        row = conn.execute("SELECT collected_at,format_version,article_count FROM country_refreshes WHERE country=?", (country,)).fetchone()
+    # Version 5 introduces alias-aware country targeting. A zero-result run is
+    # not a usable cache entry and must not suppress the next collection retry.
+    if not row or not row[0] or row[1] < 5 or int(row[2] or 0) <= 0:
         return False
     try:
         collected = datetime.fromisoformat(row[0]).astimezone(timezone.utc)
@@ -333,7 +435,7 @@ def country_cache_fresh(country, max_age_minutes=10):
 
 def record_country_refresh(country, article_count, collected_at):
     with connection() as conn:
-        conn.execute("""INSERT INTO country_refreshes(country,article_count,format_version,collected_at) VALUES(?,?,3,?)
+        conn.execute("""INSERT INTO country_refreshes(country,article_count,format_version,collected_at) VALUES(?,?,5,?)
           ON CONFLICT(country) DO UPDATE SET article_count=excluded.article_count,
           format_version=excluded.format_version,collected_at=excluded.collected_at""",
           (country, article_count, collected_at))
@@ -425,6 +527,20 @@ def country_patterns(country, limit=12, max_age_days=30):
             (country, cutoff, limit))]
 
 
+def country_pattern_anomaly_scores(max_age_days=30):
+    """Return each country's strongest positive robust-z anomaly on a 0–100 scale."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    with connection() as conn:
+        rows = conn.execute(
+            """SELECT country, MAX(anomaly_score) anomaly_score FROM story_patterns
+               WHERE last_seen>=? GROUP BY country""", (cutoff,),
+        ).fetchall()
+    return {
+        row["country"]: round(min(100, max(0.0, float(row["anomaly_score"] or 0)) / 3 * 100))
+        for row in rows
+    }
+
+
 def country_alerts(country, limit=10, max_age_days=30):
     cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
     with connection() as conn:
@@ -463,3 +579,105 @@ def database_stats():
         patterns = conn.execute("SELECT COUNT(*) FROM story_patterns").fetchone()[0]
         last = conn.execute("SELECT MAX(collected_at) FROM collection_runs").fetchone()[0]
     return {"signals": signals, "articles": articles, "patterns": patterns, "last_collection": last}
+
+
+def save_article_feedback(profile, article_key, article, feedback):
+    """Persist an explicit preference for a stable article/story key."""
+    now = datetime.now(timezone.utc).isoformat()
+    with connection() as conn:
+        conn.execute("""INSERT INTO article_feedback
+          (profile,article_key,country,headline,summary,category,transport_mode,feedback,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(profile,article_key) DO UPDATE SET
+            country=excluded.country,headline=excluded.headline,summary=excluded.summary,
+            category=excluded.category,transport_mode=excluded.transport_mode,
+            feedback=excluded.feedback,updated_at=excluded.updated_at""",
+          (profile, article_key, article.get("country"), article.get("headline") or "Untitled",
+           article.get("summary"), article.get("category"), article.get("transport_mode"),
+           1 if feedback > 0 else -1, now, now))
+
+
+def profile_feedback(profile):
+    with connection() as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM article_feedback WHERE profile=? ORDER BY updated_at DESC", (profile,))]
+
+
+def feedback_for_articles(profile, article_keys):
+    if not article_keys:
+        return {}
+    placeholders = ",".join("?" for _ in article_keys)
+    with connection() as conn:
+        rows = conn.execute(
+            f"SELECT article_key,feedback FROM article_feedback WHERE profile=? AND article_key IN ({placeholders})",
+            (profile, *article_keys),
+        ).fetchall()
+    return {row["article_key"]: row["feedback"] for row in rows}
+
+
+def clear_profile_feedback(profile):
+    with connection() as conn:
+        conn.execute("DELETE FROM article_feedback WHERE profile=?", (profile,))
+
+
+def save_country_exposure(profile, country, exposure):
+    """Store stakeholder-entered operational exposure inputs on 0–100 scales."""
+    values = {key: max(0, min(100, int(exposure.get(key, 0)))) for key in (
+        "supplier_concentration", "goods_value", "route_dependency",
+        "inventory_vulnerability", "customer_exposure", "substitution_difficulty",
+    )}
+    with connection() as conn:
+        conn.execute(
+            """INSERT INTO country_exposure
+               (profile,country,supplier_concentration,goods_value,route_dependency,
+                inventory_vulnerability,customer_exposure,substitution_difficulty,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(profile,country) DO UPDATE SET
+                 supplier_concentration=excluded.supplier_concentration,
+                 goods_value=excluded.goods_value,route_dependency=excluded.route_dependency,
+                 inventory_vulnerability=excluded.inventory_vulnerability,
+                 customer_exposure=excluded.customer_exposure,
+                 substitution_difficulty=excluded.substitution_difficulty,
+                 updated_at=excluded.updated_at""",
+            (profile, country, values["supplier_concentration"], values["goods_value"],
+             values["route_dependency"], values["inventory_vulnerability"],
+             values["customer_exposure"], values["substitution_difficulty"],
+             datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def profile_country_exposures(profile):
+    with connection() as conn:
+        rows = conn.execute("SELECT * FROM country_exposure WHERE profile=?", (profile,)).fetchall()
+    return {row["country"]: dict(row) for row in rows}
+
+
+def upsert_flight_route(route):
+    route = {**route, "origin_country": route.get("origin_country"),
+             "destination_country": route.get("destination_country")}
+    with connection() as conn:
+        conn.execute("""INSERT INTO flight_routes
+          (callsign,airline,origin_name,origin_country,origin_iata,origin_icao,origin_latitude,origin_longitude,
+           destination_name,destination_country,destination_iata,destination_icao,destination_latitude,destination_longitude,
+           source,status,checked_at)
+          VALUES (:callsign,:airline,:origin_name,:origin_country,:origin_iata,:origin_icao,:origin_latitude,:origin_longitude,
+           :destination_name,:destination_country,:destination_iata,:destination_icao,:destination_latitude,:destination_longitude,
+           :source,:status,:checked_at)
+          ON CONFLICT(callsign) DO UPDATE SET airline=excluded.airline,origin_name=excluded.origin_name,
+           origin_country=excluded.origin_country,
+           origin_iata=excluded.origin_iata,origin_icao=excluded.origin_icao,
+           origin_latitude=excluded.origin_latitude,origin_longitude=excluded.origin_longitude,
+           destination_name=excluded.destination_name,destination_country=excluded.destination_country,
+           destination_icao=excluded.destination_icao,destination_latitude=excluded.destination_latitude,
+           destination_longitude=excluded.destination_longitude,source=excluded.source,
+           status=excluded.status,checked_at=excluded.checked_at""", route)
+
+
+def flight_routes(callsigns):
+    callsigns = [value.strip().upper() for value in callsigns if value and value.strip()]
+    if not callsigns:
+        return {}
+    placeholders = ",".join("?" for _ in callsigns)
+    with connection() as conn:
+        rows = conn.execute(f"SELECT * FROM flight_routes WHERE callsign IN ({placeholders})", callsigns).fetchall()
+    return {row["callsign"]: dict(row) for row in rows}

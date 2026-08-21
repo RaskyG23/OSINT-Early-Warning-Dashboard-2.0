@@ -15,26 +15,39 @@ import pycountry
 import requests
 import websocket
 
-from app.database import record_country_refresh, record_run, upsert_aircraft_states, upsert_articles, upsert_signals, upsert_vessel_positions
+from app.database import (flight_routes, recent_signals, record_country_refresh, record_run, upsert_aircraft_states,
+                          upsert_articles, upsert_flight_route, upsert_signals, upsert_vessel_positions)
+from app.news_taxonomy import classify_general_news
 from app.patterns import analyze_observation, event_match, fact_variance, same_story, story_key
 from app.supply_chain import country_supply_chain_relevance, tone_assessment
 
 UTC = timezone.utc
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "HorizonOSINT-Docker/1.0"})
+SESSION.headers.update({"User-Agent": "OSINTEarlyWarning-Docker/2.0"})
 
 CATEGORIES = {
     "Conflicts and war": ["war conflict military", "attack security ceasefire", "defence armed forces"],
     "Politics and governance": ["politics government", "election parliament", "president minister policy"],
     "Economy and markets": ["economy markets", "inflation trade business", "investment sanctions finance"],
-    "Environment and hazards": ["environment climate", "flood earthquake wildfire", "storm drought disaster"],
+    "Environment and hazards": ["earthquake tsunami", "flood wildfire", "cyclone hurricane typhoon", "volcano drought landslide"],
     "Infrastructure and supply chains": ["infrastructure energy", "transport port shipping", "power supply chain"],
+}
+
+HAZARD_TERMS = {
+    "earthquake": ("earthquake", "seismic", "tremor", "aftershock"), "tsunami": ("tsunami",),
+    "flood": ("flood", "flooding"), "wildfire": ("wildfire", "forest fire", "bushfire"),
+    "cyclone": ("cyclone", "hurricane", "typhoon", "tropical storm"),
+    "volcano": ("volcano", "volcanic", "eruption"), "drought": ("drought",),
+    "landslide": ("landslide", "mudslide"),
 }
 
 COUNTRY_ALIASES = {
     "United States of America": "US", "United States": "US", "United Kingdom": "UK",
     "Russian Federation": "Russia", "United Arab Emirates": "UAE",
     "Democratic Republic of the Congo": "DR Congo", "Côte d'Ivoire": "Ivory Coast",
+    "Czechia": "Czech Republic", "Türkiye": "Turkey", "Cabo Verde": "Cape Verde",
+    "Timor-Leste": "East Timor", "Eswatini": "Swaziland", "North Korea": "DPRK",
+    "South Korea": "South Korea", "Laos": "Laos", "Palestine": "Palestine",
 }
 
 COUNTRY_LOOKUP_ALIASES = {
@@ -135,26 +148,67 @@ def collect_usgs():
 
 def collect_gdacs():
     provider = "GDACS"; collected = now_iso()
-    try:
-        end = datetime.now(UTC).date(); start = end - timedelta(days=7)
-        url = "https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH"
-        params = {"eventlist":"EQ;TC;FL;VO;DR;WF","fromdate":start.isoformat(),"todate":end.isoformat(),"alertlevel":"red;orange;green","pagesize":50}
-        data = SESSION.get(url, params=params, timeout=20).json(); rows = []
-        labels = {"EQ":"Earthquake","TC":"Tropical cyclone","FL":"Flood","VO":"Volcano","DR":"Drought","WF":"Wildfire"}
-        for item in data.get("features", [])[:30]:
-            if item.get("geometry", {}).get("type") != "Point": continue
-            p = item["properties"]; lon, lat = item["geometry"]["coordinates"][:2]
-            alert = str(p.get("alertlevel", "green")).lower(); severity = "Critical" if alert == "red" else "High" if alert == "orange" else "Watch"
-            report = (p.get("url") or {}).get("report") or "https://www.gdacs.org/"
+    url = "https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH"
+    event_types = ("EQ", "TC", "FL", "VO", "DR", "WF")
+    labels = {"EQ":"Earthquake","TC":"Tropical cyclone","FL":"Flood",
+              "VO":"Volcano","DR":"Drought","WF":"Wildfire"}
+    rows_by_id = {}; failures = []
+    # Query each type independently. A combined request is dominated by common
+    # earthquakes and wildfires and can omit sparse cyclones or volcanoes.
+    for requested_type in event_types:
+        try:
+            response = SESSION.get(url, params={
+                "eventlist": requested_type, "alertlevel": "Green;Orange;Red", "pagesize": 100,
+            }, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            failures.append(f"{requested_type}: {exc}")
+            continue
+        for item in data.get("features", []):
+            if not isinstance(item, dict) or item.get("geometry", {}).get("type") != "Point":
+                continue
+            p = item.get("properties") or {}
+            current = p.get("iscurrent")
+            if current is False or str(current).strip().lower() == "false":
+                continue
+            coordinates = item.get("geometry", {}).get("coordinates") or []
+            if len(coordinates) < 2:
+                continue
+            try:
+                lon, lat = float(coordinates[0]), float(coordinates[1])
+            except (TypeError, ValueError):
+                continue
+            event_type = str(p.get("eventtype") or requested_type).upper()
+            event_id = p.get("eventid")
+            if event_id is None:
+                continue
+            alert = str(p.get("alertlevel") or "green").lower()
+            severity = "Critical" if alert == "red" else "High" if alert == "orange" else "Watch"
+            urls = p.get("url") if isinstance(p.get("url"), dict) else {}
+            report = urls.get("report") or "https://www.gdacs.org/"
             description = re.sub(r"<[^>]+>", " ", p.get("htmldescription") or p.get("description") or "")
-            rows.append(_signal(id=f"gdacs-{p.get('eventtype')}-{p.get('eventid')}", source=provider,
-                event_type=labels.get(p.get("eventtype"), p.get("eventtype", "Hazard")), title=p.get("name") or p.get("description") or "GDACS alert",
-                location=p.get("country") or "Global", latitude=lat, longitude=lon, severity=severity, confidence=95,
-                summary=f"GDACS {alert} alert: {' '.join(description.split())}", outlook="Review the official GDACS report for affected areas and exposure estimates.",
-                source_url=report, source_name="GDACS", observed_at=p.get("datemodified") or collected, raw_json=json.dumps(item)))
-        upsert_signals(rows); record_run(provider, "live", len(rows), "", collected); return rows
-    except Exception as exc:
-        record_run(provider, "unavailable", 0, str(exc), collected); return []
+            title = p.get("eventname") or p.get("name") or p.get("description") or f"{labels.get(event_type, 'Hazard')} alert"
+            signal_id = f"gdacs-{event_type}-{event_id}"
+            rows_by_id[signal_id] = _signal(id=signal_id, source=provider,
+                event_type=labels.get(event_type, event_type), title=title,
+                location=p.get("country") or "Global", latitude=lat, longitude=lon,
+                severity=severity, confidence=95,
+                summary=f"GDACS {alert} alert: {' '.join(description.split())}".strip(),
+                outlook="Review the official GDACS report, affected countries, event dates and available footprint geometry.",
+                source_url=report, source_name="GDACS",
+                # The API contains only active events. Refreshing observed_at
+                # records continued feed presence while true onset/update dates
+                # remain traceable inside raw_json.
+                observed_at=collected, raw_json=json.dumps(item))
+    rows = list(rows_by_id.values())
+    if rows or len(failures) < len(event_types):
+        upsert_signals(rows)
+        message = f"Partial collection: {'; '.join(failures)}" if failures else ""
+        record_run(provider, "live", len(rows), message, collected)
+        return rows
+    record_run(provider, "unavailable", 0, "; ".join(failures), collected)
+    return []
 
 
 def collect_gdelt():
@@ -268,7 +322,8 @@ def _gdelt_story_articles(query, collected):
             publisher = article.get("domain") or urlparse(article_url).netloc or "GDELT source"
             rows.append({"headline": article.get("title") or "Untitled report", "publisher": publisher,
                 "coverage_scope": "International", "url": article_url, "source_home": article_url,
-                "published_at": published, "description": "", "source_type": "News reporting",
+                "published_at": published, "description": "", "source_type": "GDELT-indexed news",
+                "indexed_by": "GDELT",
                 "source_family": _source_family(publisher, article_url)})
     except Exception:
         pass
@@ -396,6 +451,7 @@ def _merge_story_sources(article, additions, country):
         sources.append({"publisher": item.get("publisher") or "News source", "url": item.get("url") or "",
             "origin_country": origin, "coverage_scope": item.get("coverage_scope", "International"),
             "source_type": item.get("source_type", "News reporting"),
+            "indexed_by": item.get("indexed_by"),
             "source_family": item.get("source_family") or _source_family(item.get("publisher"), item.get("source_home") or item.get("url")),
             "headline": item.get("headline", ""), "tone": tone_assessment(item.get("headline", "")),
             "fact_variance": variance})
@@ -404,6 +460,42 @@ def _merge_story_sources(article, additions, country):
     article["coverage_scope"] = "Local + international" if len(scopes) > 1 else next(iter(scopes), "International")
     base = re.sub(r"\s+This update was matched across \d+ reporting sources?\.$", "", article.get("summary") or "")
     article["summary"] = f"{base} This update was matched across {len(sources)} reporting source{'s' if len(sources) != 1 else ''}."
+    return article
+
+
+def _hazard_kinds(text):
+    lowered = (text or "").casefold()
+    return {kind for kind, markers in HAZARD_TERMS.items() if any(marker in lowered for marker in markers)}
+
+
+def _attach_hazard_signals(article, country, signals):
+    kinds = _hazard_kinds(f'{article.get("headline", "")} {article.get("summary", "")}')
+    if not kinds:
+        return article
+    try:
+        sources = json.loads(article.get("sources_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        sources = []
+    seen = {source.get("source_family") for source in sources}
+    matched = []
+    for signal in signals:
+        place = f'{signal.get("country", "")} {signal.get("location", "")} {signal.get("title", "")}'.casefold()
+        signal_kinds = _hazard_kinds(f'{signal.get("event_type", "")} {signal.get("title", "")} {signal.get("summary", "")}')
+        if country.casefold() not in place or not (kinds & signal_kinds):
+            continue
+        family = signal.get("source")
+        if family in seen:
+            continue
+        source_type = "Official hazard detection" if family in {"USGS", "GDACS"} else "Open-source event signal"
+        sources.append({"publisher": family, "url": signal.get("source_url") or "",
+                        "origin_country": "International / official", "coverage_scope": "Hazard signal",
+                        "source_type": source_type, "source_family": family,
+                        "headline": signal.get("title") or "Hazard signal",
+                        "tone": tone_assessment(signal.get("title") or "")})
+        seen.add(family); matched.append(family)
+    article["sources_json"] = json.dumps(sources, ensure_ascii=False)
+    article["hazard_status"] = "Officially detected and news corroborated" if matched else "News reported; no matching official detection stored"
+    article["hazard_providers"] = matched
     return article
 
 
@@ -419,6 +511,13 @@ def collect_country(country, enrich=False):
             (f"https://www.bing.com/news/search?q={quote_plus(query)}&format=rss&setlang=en-GB&cc=GB", "International"),
             (f"https://news.google.com/rss/search?q={quote_plus(query + ' when:30d')}&hl=en-GB&gl=GB&ceid=GB:en", "International"),
         ]
+    hazard_query = (f'"{query_country}" (earthquake OR tsunami OR flood OR wildfire OR cyclone OR '
+                    'hurricane OR typhoon OR volcano OR eruption OR drought OR landslide) when:30d')
+    category_feeds["Environment and hazards"].extend([
+        (f"https://news.google.com/rss/search?q={quote_plus(hazard_query)}&hl=en&gl={country_code}&ceid={country_code}:en", "Local / regional"),
+        (f"https://news.google.com/rss/search?q={quote_plus(hazard_query)}&hl=en-GB&gl=GB&ceid=GB:en", "International"),
+        (f"https://www.bing.com/news/search?q={quote_plus(hazard_query)}&format=rss&setlang=en-GB&cc=GB", "International"),
+    ])
     merged_by_category = {category: [] for category in CATEGORIES}
     operational_feeds = []
     for source_type, domains in OPERATIONAL_SOURCE_GROUPS.items():
@@ -495,15 +594,120 @@ def collect_country(country, enrich=False):
             for future in as_completed(futures):
                 enrichment[futures[future]].extend(future.result())
 
+    hazard_signals = recent_signals(200)
     for category, articles in output.items():
         for index, article in enumerate(articles):
             _merge_story_sources(article, enrichment[(category, index)], country)
+            if category == "Environment and hazards":
+                _attach_hazard_signals(article, country, hazard_signals)
         if articles:
             upsert_articles(country, category, articles, collected)
     total = sum(len(items) for items in output.values())
     record_country_refresh(country, total, collected)
     record_run("Global news", "live" if total else "unavailable", total, "", collected)
     return output
+
+
+def collect_country_map_snapshot(country):
+    """Lightweight country refresh used to update map risk before interaction.
+
+    Unlike the full dialog enrichment, this makes four broad operational-news
+    requests and stores up to five current stories. It is intentionally cheap
+    enough to run concurrently for the countries already represented on the
+    map or newly identified by global signals.
+    """
+    query_country = COUNTRY_ALIASES.get(country, country)
+    country_code = _country_code(country)
+    collected = now_iso()
+    operational_terms = (
+        "(port OR airport OR shipping OR freight OR cargo OR border OR railway OR factory OR power) "
+        "(closure OR closed OR delay OR disruption OR strike OR attack OR war OR flood OR earthquake OR outage OR rerouting) when:7d"
+    )
+    query = f'"{query_country}" {operational_terms}'
+    feeds = [
+        (f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en&gl={country_code}&ceid={country_code}:en", "Local / regional", "News reporting"),
+        (f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-GB&gl=GB&ceid=GB:en", "International", "News reporting"),
+        (f"https://www.bing.com/news/search?q={quote_plus(query)}&format=rss&setlang=en-GB&cc=GB", "International", "News reporting"),
+        (f"https://news.google.com/rss/search?q={quote_plus(query + ' (site:gov OR site:iata.org OR site:imo.org)')}&hl=en-GB&gl=GB&ceid=GB:en", "Primary operational", "Government notice"),
+    ]
+    rows = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(_feed_articles, url, collected, scope, source_type)
+                   for url, scope, source_type in feeds]
+        for future in as_completed(futures):
+            try:
+                rows.extend(future.result())
+            except Exception:
+                continue
+    unique = {}
+    for item in rows:
+        unique.setdefault(((item.get("publisher") or "").casefold(), item.get("url") or ""), item)
+    ranked = _cluster_stories(list(unique.values()), country, "Infrastructure and supply chains")
+    accepted = []
+    for article in ranked:
+        relevance = country_supply_chain_relevance(article, country)
+        article["country_relevance_score"] = relevance["score"]
+        article["country_relevance_reason"] = relevance["reason"]
+        if relevance["relevant"]:
+            accepted.append(article)
+    accepted.sort(key=lambda item: item.get("published_at") or "", reverse=True)
+    accepted = accepted[:5]
+    for article in accepted:
+        _attach_hazard_signals(article, country, recent_signals(200))
+    analyze_observation(country, "Infrastructure and supply chains", accepted, len(unique), collected)
+    if accepted:
+        upsert_articles(country, "Infrastructure and supply chains", accepted, collected)
+    record_country_refresh(country, len(accepted), collected)
+    return accepted
+
+
+def collect_general_news(country, limit=10):
+    """Return recent general-interest reporting for preference training.
+
+    This feed is deliberately separate from country operational intelligence:
+    it teaches the recommender what topics interest a profile, but its stories
+    do not directly enter risk or confidence calculations.
+    """
+    query_country = COUNTRY_ALIASES.get(country, country)
+    country_code = _country_code(country)
+    collected = now_iso()
+    query = f'"{query_country}" when:7d'
+    feeds = [
+        (f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en&gl={country_code}&ceid={country_code}:en", "Local / regional"),
+        (f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-GB&gl=GB&ceid=GB:en", "International"),
+        (f"https://www.bing.com/news/search?q={quote_plus(query_country)}&format=rss&setlang=en-GB&cc=GB", "International"),
+    ]
+    rows = []
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(_feed_articles, url, collected, scope) for url, scope in feeds]
+        for future in as_completed(futures):
+            try:
+                rows.extend(future.result())
+            except Exception:
+                # One blocked or malformed public feed must not take down the
+                # interest panel when the other feeds remain usable.
+                continue
+    unique = {}
+    for item in rows:
+        unique.setdefault(((item.get("publisher") or "").casefold(), item.get("url") or ""), item)
+    clustered = _cluster_stories(list(unique.values()), country, "General news")
+    related = []
+    for item in clustered:
+        # The upstream feeds are already constrained by an exact country
+        # search. Do not require the country name to appear in the headline:
+        # local publishers often use a city, institution or demonym instead.
+        item["country"] = country
+        classification = classify_general_news(item)
+        item["general_categories"] = classification["labels"]
+        item["general_category_scores"] = classification["scores"]
+        item["general_category_evidence"] = classification["evidence"]
+        # The category text is persisted with feedback and therefore becomes a
+        # useful feature for the background preference model.
+        item["category"] = " | ".join(classification["labels"])
+        item["transport_mode"] = "General news"
+        related.append(item)
+    related.sort(key=lambda item: item.get("published_at") or "", reverse=True)
+    return related[:limit]
 
 
 def collect_all():
@@ -517,11 +721,67 @@ AIS_MONITORING_ZONES = [
     [[32, -121], [35, -117]],
 ]
 
+AIS_TYPE_NAMES = {
+    30: "Fishing", 31: "Towing", 32: "Towing", 33: "Dredging or underwater operations",
+    34: "Diving operations", 35: "Military operations", 36: "Sailing", 37: "Pleasure craft",
+    50: "Pilot vessel", 51: "Search and rescue", 52: "Tug", 53: "Port tender",
+    55: "Law enforcement", 58: "Medical transport", 59: "Non-combatant ship",
+}
+
+
+def ais_vessel_type(value):
+    """Return a readable AIS ship class; it is not the vessel's actual cargo manifest."""
+    try:
+        code = int(value)
+    except (TypeError, ValueError):
+        return str(value or "").strip()
+    if 60 <= code <= 69:
+        return "Passenger"
+    if 70 <= code <= 79:
+        return "Cargo"
+    if 80 <= code <= 89:
+        return "Tanker"
+    if 90 <= code <= 99:
+        return "Other"
+    return AIS_TYPE_NAMES.get(code, f"AIS type {code}" if code else "")
+
+
+def _format_ais_eta(value):
+    if not value:
+        return ""
+    if isinstance(value, dict):
+        month, day = value.get("Month"), value.get("Day")
+        hour, minute = value.get("Hour"), value.get("Minute")
+        if all(part is not None for part in (month, day, hour, minute)):
+            return f"{int(day):02d}/{int(month):02d} {int(hour):02d}:{int(minute):02d} UTC"
+    if isinstance(value, (int, float)):
+        packed = int(value)
+        month, day = (packed >> 16) & 15, (packed >> 11) & 31
+        hour, minute = (packed >> 6) & 31, packed & 63
+        if 1 <= month <= 12 and 1 <= day <= 31 and 0 <= hour <= 23 and 0 <= minute <= 59:
+            return f"{day:02d}/{month:02d} {hour:02d}:{minute:02d} UTC"
+    return str(value).strip()
+
+
+def country_maritime_tracker_urls(country):
+    """Country-centred browser alternatives when no embeddable open global AIS API is available."""
+    try:
+        south, north, west, east = _country_bounds(country, 0.5)
+        latitude, longitude = (south + north) / 2, (west + east) / 2
+        marine_traffic = (f"https://www.marinetraffic.com/en/ais/home/"
+                          f"centerx:{longitude:.4f}/centery:{latitude:.4f}/zoom:5")
+    except Exception:
+        marine_traffic = "https://www.marinetraffic.com/en/ais/home"
+    return {
+        "MarineTraffic live map": marine_traffic,
+        "VesselFinder live map": "https://www.vesselfinder.com/",
+    }
+
 
 def _country_bounds(country, margin=1.5):
     response = SESSION.get("https://nominatim.openstreetmap.org/search", params={
         "country": country, "format": "jsonv2", "limit": 1, "addressdetails": 0,
-    }, headers={"User-Agent": "HorizonOSINT-Docker/1.0 vessel-monitor"}, timeout=(3.5, 8))
+    }, headers={"User-Agent": "OSINTEarlyWarning-Docker/2.0 vessel-monitor"}, timeout=(3.5, 8))
     response.raise_for_status(); results = response.json()
     if not results or not results[0].get("boundingbox"):
         raise ValueError(f"No geographic bounds returned for {country}")
@@ -542,12 +802,15 @@ def collect_aisstream(country=None, duration_seconds=None, max_positions=500):
         record_run(provider, "setup required", 0, "AISSTREAM_API_KEY is not configured", collected)
         return []
     rows = []
+    rows_by_mmsi = {}
+    static_by_mmsi = {}
     try:
         monitoring_country = country or "Global strategic waterways"
         monitoring_zones = _country_ais_zone(country) if country else AIS_MONITORING_ZONES
         ws = websocket.create_connection("wss://stream.aisstream.io/v0/stream", timeout=5)
         ws.send(json.dumps({"APIKey": api_key, "BoundingBoxes": monitoring_zones,
-            "FilterMessageTypes": ["PositionReport", "StandardClassBPositionReport", "ExtendedClassBPositionReport"]}))
+            "FilterMessageTypes": ["PositionReport", "StandardClassBPositionReport",
+                                   "ExtendedClassBPositionReport", "ShipStaticData", "StaticDataReport"]}))
         ws.settimeout(1.5); deadline = datetime.now(UTC).timestamp() + max(2, min(duration, 30))
         while datetime.now(UTC).timestamp() < deadline and len(rows) < max_positions:
             try:
@@ -555,24 +818,281 @@ def collect_aisstream(country=None, duration_seconds=None, max_positions=500):
             except websocket.WebSocketTimeoutException:
                 continue
             message = payload.get("Message") or {}
+            message_type = payload.get("MessageType") or ""
+            metadata = payload.get("MetaData") or payload.get("Metadata") or {}
+            static = message.get("ShipStaticData") or message.get("StaticDataReport") or {}
+            if message_type in {"ShipStaticData", "StaticDataReport"} or static:
+                mmsi = str(metadata.get("MMSI") or static.get("UserID") or "").strip()
+                if mmsi:
+                    values = {
+                        "ship_name": str(static.get("Name") or metadata.get("ShipName") or "").strip(),
+                        "vessel_type": ais_vessel_type(static.get("Type") or metadata.get("ShipType")),
+                        "imo": str(static.get("ImoNumber") or "").strip(),
+                        "call_sign": str(static.get("CallSign") or "").strip(),
+                        "destination": str(static.get("Destination") or "").strip(),
+                        "eta": _format_ais_eta(static.get("Eta")),
+                        "draught_m": static.get("MaximumPresentStaticDraught"),
+                    }
+                    static_by_mmsi[mmsi] = {key: value for key, value in values.items() if value not in (None, "")}
+                    if mmsi in rows_by_mmsi:
+                        rows_by_mmsi[mmsi].update(static_by_mmsi[mmsi])
+                continue
             report = (message.get("PositionReport") or message.get("StandardClassBPositionReport")
                 or message.get("ExtendedClassBPositionReport") or {})
-            metadata = payload.get("MetaData") or {}
             latitude = report.get("Latitude", metadata.get("latitude", metadata.get("Latitude")))
             longitude = report.get("Longitude", metadata.get("longitude", metadata.get("Longitude")))
             mmsi = str(metadata.get("MMSI") or report.get("UserID") or "").strip()
             if not mmsi or latitude is None or longitude is None:
                 continue
             observed = metadata.get("time_utc") or now_iso()
-            rows.append({"mmsi": mmsi, "ship_name": (metadata.get("ShipName") or "").strip() or f"MMSI {mmsi}",
+            row = {"mmsi": mmsi, "ship_name": (metadata.get("ShipName") or "").strip() or f"MMSI {mmsi}",
+                "vessel_type": ais_vessel_type(metadata.get("ShipType") or report.get("ShipType")),
+                "imo": "", "call_sign": "", "last_port": "", "destination": "", "eta": "", "draught_m": None,
                 "latitude": float(latitude), "longitude": float(longitude),
                 "speed_knots": float(report.get("Sog") or 0), "course": float(report.get("Cog") or 0),
                 "heading": float(report.get("TrueHeading") or 0), "observed_at": observed,
-                "collected_at": collected, "source": provider, "monitor_country": monitoring_country})
+                "collected_at": collected, "source": provider, "monitor_country": monitoring_country}
+            row.update(static_by_mmsi.get(mmsi, {}))
+            rows.append(row); rows_by_mmsi[mmsi] = row
         ws.close()
-        upsert_vessel_positions(rows); record_run(provider, "live", len(rows), "", collected); return rows
+        upsert_vessel_positions(rows)
+        if rows:
+            record_run(provider, "live", len(rows), "", collected)
+        else:
+            record_run(provider, "no data", 0,
+                       "The AISStream connection opened but returned zero frames; the upstream beta feed may be silent.",
+                       collected)
+        return rows
     except Exception as exc:
         record_run(provider, "unavailable", 0, str(exc), collected); return []
+
+
+def _fintraffic_items(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    if isinstance(payload.get("features"), list):
+        return payload["features"]
+    for key in ("vessels", "locations", "data"):
+        if isinstance(payload.get(key), list):
+            return payload[key]
+    return []
+
+
+def collect_fintraffic_vessels(country, max_positions=500):
+    """Official open live AIS fallback for Finland and nearby Finnish waters."""
+    provider = "Fintraffic AIS"; collected = now_iso()
+    if (country or "").strip().casefold() != "finland":
+        return []
+    try:
+        locations_response = SESSION.get("https://meri.digitraffic.fi/api/ais/v1/locations", timeout=(4, 15))
+        metadata_response = SESSION.get("https://meri.digitraffic.fi/api/ais/v1/vessels", timeout=(4, 15))
+        locations_response.raise_for_status(); metadata_response.raise_for_status()
+        metadata_by_mmsi = {}
+        for item in _fintraffic_items(metadata_response.json()):
+            values = item.get("properties", item) if isinstance(item, dict) else {}
+            mmsi = str(values.get("mmsi") or values.get("MMSI") or values.get("id") or "").strip()
+            if mmsi:
+                metadata_by_mmsi[mmsi] = values
+        rows = []
+        for feature in _fintraffic_items(locations_response.json()):
+            if not isinstance(feature, dict):
+                continue
+            props = feature.get("properties", feature)
+            coordinates = (feature.get("geometry") or {}).get("coordinates") or []
+            mmsi = str(feature.get("mmsi") or props.get("mmsi") or props.get("MMSI") or props.get("id") or "").strip()
+            metadata = metadata_by_mmsi.get(mmsi, {})
+            longitude = coordinates[0] if len(coordinates) >= 2 else props.get("longitude") or props.get("lon")
+            latitude = coordinates[1] if len(coordinates) >= 2 else props.get("latitude") or props.get("lat")
+            if not mmsi or latitude is None or longitude is None:
+                continue
+            raw_time = props.get("timestampExternal") or props.get("timestamp") or props.get("time") or collected
+            try:
+                numeric_time = float(raw_time)
+                if numeric_time > 10_000_000_000:
+                    numeric_time /= 1000
+                observed = datetime.fromtimestamp(numeric_time, UTC).isoformat()
+            except (TypeError, ValueError, OSError):
+                observed = str(raw_time).replace("Z", "+00:00")
+            draught = metadata.get("draught")
+            if isinstance(draught, (int, float)):
+                draught = float(draught) / 10
+            rows.append({
+                "mmsi": mmsi, "ship_name": str(metadata.get("name") or f"MMSI {mmsi}").strip(),
+                "vessel_type": ais_vessel_type(metadata.get("shipType") or metadata.get("type")),
+                "imo": str(metadata.get("imo") or "").strip(), "call_sign": str(metadata.get("callSign") or "").strip(),
+                "last_port": "", "destination": str(metadata.get("destination") or "").strip(),
+                "eta": _format_ais_eta(metadata.get("eta")), "draught_m": draught,
+                "latitude": float(latitude), "longitude": float(longitude),
+                "speed_knots": float(props.get("sog") or 0), "course": float(props.get("cog") or 0),
+                "heading": float(props.get("heading") or 0), "observed_at": observed,
+                "collected_at": collected, "source": provider, "monitor_country": country,
+            })
+            if len(rows) >= max_positions:
+                break
+        upsert_vessel_positions(rows)
+        record_run(provider, "live" if rows else "no data", len(rows),
+                   "" if rows else "Fintraffic returned no current vessel positions.", collected)
+        return rows
+    except Exception as exc:
+        record_run(provider, "unavailable", 0, str(exc), collected)
+        return []
+
+
+def _country_is(country, *names):
+    value = (country or "").strip().casefold()
+    return value in {name.casefold() for name in names}
+
+
+def collect_barentswatch_vessels(country, max_positions=500):
+    """Open Norwegian Coastal Administration AIS, when free API credentials are configured."""
+    provider = "BarentsWatch AIS"; collected = now_iso()
+    if not _country_is(country, "Norway", "Svalbard and Jan Mayen"):
+        return []
+    client_id = os.getenv("BARENTSWATCH_CLIENT_ID", "").strip()
+    client_secret = os.getenv("BARENTSWATCH_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        record_run(provider, "setup required", 0,
+                   "Create a free BarentsWatch API client and configure BARENTSWATCH_CLIENT_ID and BARENTSWATCH_CLIENT_SECRET.",
+                   collected)
+        return []
+    try:
+        token_response = SESSION.post("https://id.barentswatch.no/connect/token", data={
+            "client_id": client_id, "client_secret": client_secret,
+            "scope": "ais", "grant_type": "client_credentials",
+        }, timeout=(4, 12))
+        token_response.raise_for_status()
+        access_token = token_response.json().get("access_token")
+        if not access_token:
+            raise ValueError("BarentsWatch did not return an access token")
+        response = SESSION.get(
+            "https://live.ais.barentswatch.no/v1/latest/combined",
+            params={"modelType": "Full"},
+            headers={"Authorization": f"Bearer {access_token}"}, timeout=(4, 20),
+        )
+        response.raise_for_status(); rows = []
+        for item in response.json() if isinstance(response.json(), list) else []:
+            if not isinstance(item, dict) or item.get("latitude") is None or item.get("longitude") is None:
+                continue
+            mmsi = str(item.get("mmsi") or "").strip()
+            if not mmsi:
+                continue
+            draught = item.get("draught")
+            if isinstance(draught, (int, float)) and draught > 25:
+                draught = float(draught) / 10
+            rows.append({
+                "mmsi": mmsi, "ship_name": str(item.get("name") or f"MMSI {mmsi}").strip(),
+                "vessel_type": ais_vessel_type(item.get("shipType")),
+                "imo": str(item.get("imoNumber") or "").strip(),
+                "call_sign": str(item.get("callSign") or "").strip(), "last_port": "",
+                "destination": str(item.get("destination") or "").strip(),
+                "eta": _format_ais_eta(item.get("eta")), "draught_m": draught,
+                "latitude": float(item["latitude"]), "longitude": float(item["longitude"]),
+                "speed_knots": float(item.get("speedOverGround") or 0),
+                "course": float(item.get("courseOverGround") or 0),
+                "heading": float(item.get("trueHeading") or 0),
+                "observed_at": str(item.get("msgtime") or collected).replace("Z", "+00:00"),
+                "collected_at": collected, "source": provider, "monitor_country": country,
+            })
+            if len(rows) >= max_positions:
+                break
+        upsert_vessel_positions(rows)
+        record_run(provider, "live" if rows else "no data", len(rows),
+                   "" if rows else "BarentsWatch returned no current vessel positions.", collected)
+        return rows
+    except Exception as exc:
+        record_run(provider, "unavailable", 0, str(exc), collected)
+        return []
+
+
+def _gfw_last_port(entry):
+    """Extract a readable anchorage/port label across GFW event schema versions."""
+    if not isinstance(entry, dict):
+        return ""
+    visit = entry.get("port_visit") or entry.get("portVisit") or {}
+    regions = entry.get("regions") or {}
+    candidates = [
+        visit.get("name"), visit.get("portName"), entry.get("portName"),
+        regions.get("namedAnchorage") if isinstance(regions, dict) else None,
+        regions.get("port") if isinstance(regions, dict) else None,
+    ]
+    for value in candidates:
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("label")
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def enrich_vessels_with_gfw(vessels, max_lookups=12):
+    """Add open GFW registry identity and recent port-visit context to live regional AIS rows."""
+    provider = "Global Fishing Watch"; collected = now_iso()
+    token = os.getenv("GFW_API_ACCESS_TOKEN", "").strip()
+    if not vessels:
+        return []
+    if not token:
+        record_run(provider, "setup required", 0,
+                   "Configure a free non-commercial GFW_API_ACCESS_TOKEN for vessel identity and historical port visits.",
+                   collected)
+        return vessels
+    enriched = []
+    try:
+        for original in vessels[:max_lookups]:
+            row = dict(original); mmsi = str(row.get("mmsi") or "").strip()
+            if not mmsi:
+                enriched.append(row); continue
+            search = SESSION.get("https://gateway.api.globalfishingwatch.org/v3/vessels/search", params={
+                "query": mmsi, "datasets[0]": "public-global-vessel-identity:latest", "limit": 1,
+            }, headers={"Authorization": f"Bearer {token}"}, timeout=(4, 12))
+            search.raise_for_status(); entries = search.json().get("entries") or []
+            if entries:
+                identity = entries[0]
+                vessel_id = identity.get("id") or identity.get("vesselId")
+                self_reported = identity.get("selfReportedInfo") or []
+                if isinstance(self_reported, list):
+                    self_reported = self_reported[0] if self_reported else {}
+                if isinstance(self_reported, dict):
+                    row["ship_name"] = row.get("ship_name") or self_reported.get("shipname") or self_reported.get("shipName")
+                    row["imo"] = row.get("imo") or self_reported.get("imo") or ""
+                    row["call_sign"] = row.get("call_sign") or self_reported.get("callsign") or ""
+                    row["vessel_type"] = row.get("vessel_type") or self_reported.get("shiptype") or ""
+                if vessel_id:
+                    events = SESSION.get("https://gateway.api.globalfishingwatch.org/v3/events", params={
+                        "datasets[0]": "public-global-port-visits-events:latest",
+                        "vessels[0]": vessel_id, "sort": "-start", "limit": 1, "offset": 0,
+                    }, headers={"Authorization": f"Bearer {token}"}, timeout=(4, 12))
+                    events.raise_for_status(); port_events = events.json().get("entries") or []
+                    if port_events:
+                        row["last_port"] = _gfw_last_port(port_events[0]) or row.get("last_port") or ""
+                row["source"] = f'{row.get("source") or "AIS"} + Global Fishing Watch'
+            enriched.append(row)
+        enriched.extend(dict(item) for item in vessels[max_lookups:])
+        upsert_vessel_positions(enriched)
+        record_run(provider, "live", len(enriched), "Vessel identity/port-visit enrichment completed.", collected)
+        return enriched
+    except Exception as exc:
+        record_run(provider, "unavailable", 0, str(exc), collected)
+        return vessels
+
+
+def collect_vessel_activity(country, duration_seconds=20, max_positions=500):
+    """Hybrid open-data vessel pipeline: live official regional AIS plus GFW enrichment."""
+    rows = []
+    rows.extend(collect_fintraffic_vessels(country, max_positions=max_positions))
+    rows.extend(collect_barentswatch_vessels(country, max_positions=max_positions))
+    # Deduplicate by MMSI, preferring the record with more populated voyage fields.
+    merged = {}
+    for row in rows:
+        key = str(row.get("mmsi") or "")
+        current = merged.get(key)
+        richness = sum(bool(row.get(field)) for field in
+                       ("ship_name", "vessel_type", "imo", "call_sign", "last_port", "destination", "eta"))
+        current_richness = sum(bool(current.get(field)) for field in
+                               ("ship_name", "vessel_type", "imo", "call_sign", "last_port", "destination", "eta")) if current else -1
+        if richness > current_richness:
+            merged[key] = row
+    return enrich_vessels_with_gfw(list(merged.values()))
 
 
 def collect_opensky(country, max_aircraft=500):
@@ -597,3 +1117,50 @@ def collect_opensky(country, max_aircraft=500):
         upsert_aircraft_states(rows);record_run(provider,"live",len(rows),"",collected);return rows
     except Exception as exc:
         record_run(provider,"unavailable",0,str(exc),collected);return []
+
+
+def collect_flight_routes(aircraft, max_lookups=40, cache_hours=24):
+    """Resolve ADS-B callsigns to static route metadata with a bounded cache."""
+    callsigns = list(dict.fromkeys(
+        str(item.get("callsign") or "").strip().upper() for item in aircraft
+        if str(item.get("callsign") or "").strip()
+    ))[:max_lookups]
+    cached = flight_routes(callsigns)
+    cutoff = datetime.now(UTC) - timedelta(hours=cache_hours)
+    output = {}
+    for callsign in callsigns:
+        cached_route = cached.get(callsign)
+        try:
+            checked = datetime.fromisoformat(cached_route["checked_at"]).astimezone(UTC) if cached_route else None
+        except (TypeError, ValueError):
+            checked = None
+        if checked and checked >= cutoff:
+            output[callsign] = cached_route
+            continue
+        checked_at = now_iso()
+        blank = {"callsign": callsign, "airline": None, "origin_name": None, "origin_country": None, "origin_iata": None,
+                 "origin_icao": None, "origin_latitude": None, "origin_longitude": None,
+                 "destination_name": None, "destination_country": None, "destination_iata": None, "destination_icao": None,
+                 "destination_latitude": None, "destination_longitude": None,
+                 "source": "ADSBDB", "status": "unavailable", "checked_at": checked_at}
+        try:
+            response = SESSION.get(f"https://api.adsbdb.com/v0/callsign/{quote_plus(callsign)}", timeout=(3, 6))
+            response.raise_for_status()
+            route = (response.json().get("response") or {}).get("flightroute") or {}
+            origin, destination = route.get("origin") or {}, route.get("destination") or {}
+            if not origin or not destination:
+                raise ValueError("No route record")
+            airline = route.get("airline") or {}
+            blank.update({"airline": airline.get("name"), "origin_name": origin.get("name"),
+                "origin_country": origin.get("country_name"),
+                "origin_iata": origin.get("iata_code"), "origin_icao": origin.get("icao_code"),
+                "origin_latitude": origin.get("latitude"), "origin_longitude": origin.get("longitude"),
+                "destination_name": destination.get("name"), "destination_country": destination.get("country_name"),
+                "destination_iata": destination.get("iata_code"),
+                "destination_icao": destination.get("icao_code"), "destination_latitude": destination.get("latitude"),
+                "destination_longitude": destination.get("longitude"), "status": "matched"})
+        except Exception:
+            pass
+        upsert_flight_route(blank)
+        output[callsign] = blank
+    return output

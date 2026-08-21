@@ -19,11 +19,11 @@ docker image prune --force
 
 echo "Recreating the current port-8502 dashboard with a 2 GB memory cap..."
 cd "$CURRENT_DIR" || exit 1
-docker compose up -d --build --force-recreate
+docker compose up -d --build --force-recreate --remove-orphans
 
 echo
 echo "Current dashboard resource usage:"
-docker stats --no-stream horizon-streamlit-dashboard
+docker stats --no-stream osint-early-warning-dashboard
 echo
 echo "Docker disk usage after cleanup:"
 docker system df

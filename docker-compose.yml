@@ -1,8 +1,8 @@
 services:
-  horizon-dashboard:
+  osint-dashboard:
     build: .
-    image: horizon-streamlit-sqlite:local
-    container_name: horizon-streamlit-dashboard
+    image: osint-early-warning-dashboard:local
+    container_name: osint-early-warning-dashboard
     init: true
     ports:
       - "8502:8501"
@@ -10,8 +10,13 @@ services:
       - ./data:/app/data
     environment:
       PYTHONPATH: /app
-      HORIZON_DB_PATH: /app/data/horizon.sqlite
-      HORIZON_REFRESH_MINUTES: ${HORIZON_REFRESH_MINUTES:-15}
+      OSINT_DB_PATH: /app/data/osint-dashboard.sqlite
+      OSINT_REFRESH_MINUTES: ${OSINT_REFRESH_MINUTES:-15}
+      AISSTREAM_API_KEY: ${AISSTREAM_API_KEY:-}
+      BARENTSWATCH_CLIENT_ID: ${BARENTSWATCH_CLIENT_ID:-}
+      BARENTSWATCH_CLIENT_SECRET: ${BARENTSWATCH_CLIENT_SECRET:-}
+      GFW_API_ACCESS_TOKEN: ${GFW_API_ACCESS_TOKEN:-}
+      OPENSKY_TOKEN: ${OPENSKY_TOKEN:-}
       OMP_NUM_THREADS: "1"
       OPENBLAS_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"

@@ -40,6 +40,10 @@ EVENT_EQUIVALENTS = {
     "attacks": "attack", "attacked": "attack", "strikes": "strike", "struck": "strike",
     "shipping": "ship", "vessels": "vessel", "flights": "flight",
 }
+GENERIC_EVENT_WORDS = STOPWORDS | {
+    "libya", "country", "security", "energy", "operations", "infrastructure", "crisis",
+    "risk", "risks", "threat", "threaten", "deepens", "worsening", "faces", "means",
+}
 
 
 def story_key(headline):
@@ -60,6 +64,27 @@ def event_match(left_headline, right_headline):
     left = normalize(story_key(left_headline).split())
     right = normalize(story_key(right_headline).split())
     if same_story(" ".join(left), " ".join(right)):
+        return True
+    # Cluster continued coverage of the same named incident even when outlets
+    # describe the affected asset differently (for example a refinery, power
+    # substation or broader energy infrastructure). A shared specific place or
+    # named entity plus the same threat mechanism is stronger evidence than a
+    # generic country/category overlap.
+    combined_left, combined_right = (left_headline or "").casefold(), (right_headline or "").casefold()
+    threat_terms = {"drone", "missile", "earthquake", "flood", "wildfire", "cyclone",
+                    "explosion", "fire", "strike", "attack", "closure", "outage", "protest"}
+    shared_threat = (_tokens := (left & right & threat_terms))
+    shared_specific = {
+        word for word in left & right
+        if word not in GENERIC_EVENT_WORDS | EVENT_ACTORS | EVENT_ACTIONS | EVENT_TARGETS
+        and len(word) >= 5 and not word.isdigit()
+    }
+    if shared_threat and shared_specific:
+        return True
+    # Drone/missile "strike" and "attack" are synonymous event descriptions.
+    armed_mechanism = any(term in combined_left for term in ("drone", "missile")) and any(
+        term in combined_right for term in ("drone", "missile"))
+    if armed_mechanism and shared_specific and ({"strike", "attack"} & left) and ({"strike", "attack"} & right):
         return True
     actor = left & right & EVENT_ACTORS
     action = left & right & EVENT_ACTIONS
@@ -130,10 +155,24 @@ def synthesize_event_headline(headlines, country):
         ("port operations", ("port operations", "port closure", "port closed", "port")),
         ("commercial shipping", ("shipping", "ship", "vessel")),
         ("airspace and flight operations", ("airspace", "flight", "airline")),
+        ("road-freight operations", ("cargo convoy", "freight truck", "trucking", "highway", "road freight")),
+        ("rail-freight operations", ("freight train", "rail freight", "railway", "rail line")),
+        ("border and customs operations", ("border crossing", "customs", "land border")),
+        ("warehouse and distribution operations", ("warehouse", "distribution centre", "distribution center")),
+        ("energy-supply infrastructure", ("pipeline", "refinery", "fuel terminal", "power grid")),
         ("freight operations", ("cargo", "freight")),
     )
     asset = next((label for label, markers in asset_markers if any(marker in lowered for marker in markers)),
                  "supply-chain operations")
+
+    # Never replace a detailed source-supported description with a vague
+    # country template. If the cluster does not identify a concrete affected
+    # asset, retain the best-supported detailed headline selected from the
+    # whole cluster. This specifically prevents outputs such as "Attack targets
+    # supply-chain operations affecting Mexico" from appearing for any country.
+    if asset == "supply-chain operations":
+        return representative[:1].upper() + representative[1:]
+
     location = f" in {routes[0]}" if routes else f" affecting {country}"
 
     if any(term in lowered for term in ("missile attack", "missile strike")):
