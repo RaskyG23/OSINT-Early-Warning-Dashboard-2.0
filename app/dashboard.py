@@ -414,8 +414,15 @@ with top2:
     refresh = st.button("↻ Live refresh", type="primary", use_container_width=True)
 
 if not st.session_state.collected:
-    with st.spinner("Collecting GDELT, GDACS and USGS signals…"):
-        collect_all()
+    if HOST_MODE == "Browser-hosted Streamlit":
+        # Draw the public examiner interface immediately. Community Cloud can
+        # buffer the whole first script run while remote providers respond,
+        # which otherwise presents as a blank page. Live refresh remains the
+        # explicit, visible action for obtaining the newest public signals.
+        st.info("Dashboard ready. Select Live refresh to retrieve the newest GDELT, GDACS and USGS signals.")
+    else:
+        with st.spinner("Collecting GDELT, GDACS and USGS signals…"):
+            collect_all()
     st.session_state.collected = True
 
 
