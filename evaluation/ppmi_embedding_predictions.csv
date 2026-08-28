@@ -1,0 +1,33 @@
+id,split,country,headline,coverage,disruption_label,disruption_score,disruption_prediction,severity_label,severity_score,severity_prediction,transport_label,transport_score,transport_prediction
+2813,calibration,Iran,Iran Lost 100 Civil Aircraft In Early Stages Of Conflict - Aviation Week,1.0,1,0.2085,1,1,0.3576,1,1,0.2407,1
+2784,calibration,Nigeria,COP17: Nigeria calls for a binding agreement on drought management - Table.Briefings,0.9474,0,0.1623,0,0,0.2768,0,0,0.1869,0
+2712,calibration,Moldova,Moldova Confirms Russian Strike Drone Crashed Near Ukrainian Border - Межа. Новини України.,0.9375,0,0.1821,1,1,0.315,1,0,0.2453,1
+2687,calibration,Israel,Wildcat labor strike brings Ben Gurion Airport to halt on busiest travel day of year - The Times of Israel,0.8,1,0.2409,1,0,0.3192,1,1,0.3385,1
+2682,calibration,Ghana,GRIDCo engineers working to restore power after widespread outage - Ghana News Agency,0.9474,1,0.3534,1,0,0.2951,0,0,0.2342,0
+2403,calibration,Ghana,"Bawumia, Japanese Ambassador discuss digitalization, fintech, artificial intelligence, flood control - Modern Ghana",0.8421,0,0.1656,0,0,0.1872,0,0,0.1243,0
+2713,calibration,Moldova,Checkpoint on border with Moldova in Odesa region continues to operate after Russian attack – Border Guard Service - Interfax-Ukraine,0.875,0,0.23,1,1,0.4522,1,1,0.2433,1
+2456,calibration,Germany,"DW News. . Severe weather in Germany, a war in Ukraine, and a blocked strait in the Gulf — how one field has been impacted by three separate, global events. #dwbusiness - facebook.com",0.9143,1,0.2166,1,1,0.4019,1,1,0.2447,1
+2572,calibration,India,"Ratul Puri led Hindustan Power achieves financial closure of INR 1,135 crore for its 435 MWp solar project in Uttar Pradesh - pv magazine India",0.7241,0,0.3348,1,0,0.2851,0,0,0.2279,0
+2689,calibration,Israel,Flights resume at Israel's Ben Gurion Airport after staff strike - news.cgtn.com,0.9167,0,0.251,1,0,0.3681,1,1,0.3897,1
+2374,calibration,Canada,Water firm 'extremely sorry' over burst pipe flood - Yahoo News Canada,0.9091,1,0.184,1,0,0.2931,0,0,0.2208,0
+2358,calibration,Sudan,"Sudan’s Kordofan Crisis Deepens As Fighting And Flood Displace Over 200,000 - Outlook India",0.85,1,0.1914,1,1,0.2683,0,0,0.2015,0
+2597,calibration,Russia,Russia strikes Ukraine-Moldova border checkpoint in overnight drone attack - The New Voice of Ukraine,1.0,1,0.2041,1,1,0.4615,1,1,0.2203,0
+2524,calibration,Poland,Poland activated its aviation and air defense due to Russia's nighttime attack on Ukraine - Українські Національні Новини (УНН),0.9091,0,0.172,0,1,0.4276,1,1,0.2525,1
+2582,calibration,United Kingdom,All power to the UK competition watchdog’s war on ‘drip pricing’ - The Guardian,0.8889,0,0.2291,1,0,0.4228,1,0,0.232,0
+2548,calibration,United Kingdom,Seven in 10 UK flood claims are flash floods - and treating all the same is how insurers misprice it - Insurance Business,0.8519,0,0.1924,1,0,0.2881,0,0,0.2016,0
+2794,test,Iran,US says sanctions will 'squash' Iran's economy and 'collapse' its regime - BBC,0.9412,1,0.1905,1,1,0.3725,1,0,0.2187,0
+2479,test,Russia,Russian missile barrage kills at least 16 people in Ukraine’s Kyiv - Al Jazeera,1.0,0,0.1968,1,1,0.3927,1,0,0.2549,1
+2547,test,United Kingdom,Coordinated drought response intensifies amid extreme weather - GOV.UK,1.0,0,0.1977,1,1,0.3104,1,0,0.2315,0
+2747,test,Saudi Arabia,Houthi Ansar Allah Movement Threatens 'Fifth Stage' Of War Against Saudi Arabia; Pro-Hizbullah Daily Claims Houthis Are Preparing Large-Scale Ground Campaign On Saudi Border - MEMRI | Middle East Media Research Institute,0.8333,0,0.1849,1,1,0.42,1,0,0.2009,0
+2683,test,Ghana,GRIDCo blames major transmission fault for nationwide power outage - GBC Ghana Online,0.8947,1,0.349,1,0,0.1919,0,0,0.2257,0
+2795,test,Iran,"US-Iran War Live Updates: Iran Slams Trump's Sanctions, Calls US Policy 'Economic Terrorism'",1.0,0,0.177,0,1,0.3375,1,0,0.1901,0
+2688,test,Israel,Ben Gurion Airport expected to close as workers stage surprise stoppage on biggest travel day of year - The Times of Israel,0.8889,1,0.2373,1,0,0.3257,1,1,0.3155,1
+2491,test,Russia,Serbia Turns to Russia for Wildfire Support Amid EU Shortage - Devdiscourse,0.9688,0,0.2015,1,1,0.3312,1,0,0.2223,0
+2421,test,Israel,"No matter what Israel does, all children here should feel safe; wildfire insurance; giving back (Letters) - Daily Camera",0.8,0,0.1587,0,0,0.2479,0,0,0.1745,0
+2592,test,United States,Somali pirate menace returns as U.S.-Iran war stokes regional chaos and saps enforcement resources - CNBC,0.7083,1,0.1856,1,1,0.4082,1,1,0.2144,0
+2480,test,Russia,Russia launches deadly missile and drone attacks on Kyiv - Financial Times,1.0,0,0.1828,1,1,0.424,1,0,0.2397,0
+2598,test,Russia,"Russia launched a massive attack on the southern part of the Odesa region, leaving 13,000 people without power - UA.NEWS",0.96,1,0.222,1,1,0.4482,1,0,0.2223,0
+2686,test,Ghana,Widespread power outage hits parts of Ghana - Adomonline.com,0.9688,1,0.3372,1,0,0.3181,1,0,0.2445,1
+2525,test,Poland,Poland raises alert level near Ukrainian border amid massive Russian attack - Baltic News Network,0.8571,0,0.1852,1,1,0.4302,1,1,0.2458,1
+2368,test,Canada,Canada Condemns Drone Attack Targeting Kurdistan Region Prime Minister’s Office - Kurdistan24,0.9444,0,0.1392,0,1,0.429,1,0,0.2134,0
+2573,test,India,Assam: Agitated residents lock APDCL office in Abhayapuri over prolonged power outage - India Today NE,0.8182,1,0.3291,1,0,0.281,0,0,0.2472,1

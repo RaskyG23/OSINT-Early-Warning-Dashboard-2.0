@@ -5,7 +5,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DB_PATH = Path(os.getenv("OSINT_DB_PATH", "/app/data/osint-dashboard.sqlite"))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DB_PATH = Path(os.getenv("OSINT_DB_PATH", str(PROJECT_ROOT / "data" / "osint-dashboard.sqlite")))
 
 
 @contextmanager

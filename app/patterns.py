@@ -46,8 +46,13 @@ GENERIC_EVENT_WORDS = STOPWORDS | {
 }
 
 
+def strip_publisher_suffix(headline):
+    """Remove a final feed-added publisher label without changing event text."""
+    return re.sub(r"\s+[\-–—]\s+[^\-–—]{2,80}$", "", headline or "").strip()
+
+
 def story_key(headline):
-    clean = re.sub(r"\s+-\s+[^-]+$", "", (headline or "").lower())
+    clean = strip_publisher_suffix(headline).lower()
     return " ".join(word for word in re.findall(r"[a-z0-9]+", clean) if word not in STOPWORDS)
 
 

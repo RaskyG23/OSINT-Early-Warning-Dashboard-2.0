@@ -7,6 +7,9 @@ services:
     ports:
       - "8502:8501"
     volumes:
+      # Mount the application source so safe dashboard fixes are visible after
+      # a container restart without relying on a stale previously built image.
+      - ./app:/app/app:ro
       - ./data:/app/data
     environment:
       PYTHONPATH: /app

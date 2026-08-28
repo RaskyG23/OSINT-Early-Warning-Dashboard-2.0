@@ -1,6 +1,34 @@
 # OSINT Early Warning Dashboard 2.0
 
-This project provides the OSINT Early Warning Dashboard as a local Docker application.
+This project provides the OSINT Early Warning Dashboard as a browser-hosted
+Streamlit application and as a reproducible local Docker application.
+
+## Examiner quick access (no installation)
+
+The recommended examination route is the public Streamlit Community Cloud
+deployment. The examiner opens the supplied `streamlit.app` link in a modern
+web browser; no Docker, Python, GitHub account, ChatGPT account or project
+download is required. The repository remains public so source files,
+evaluation data and documentation can also be inspected online.
+
+The hosted entry point is `streamlit_app.py`. It runs the same dashboard code
+as Docker but uses a writable project-local SQLite file. Community Cloud may
+restart or sleep the free service, so its SQLite demonstration history can be
+reset. The Docker package remains the reproducible fallback when persistent
+local history is required.
+
+### Deploy on Streamlit Community Cloud
+
+1. Push this public repository to GitHub.
+2. Sign in at <https://share.streamlit.io> with GitHub and select **Create app**.
+3. Choose repository `RaskyG23/OSINT-Early-Warning-Dashboard-2.0`.
+4. Select the deployment branch and enter `streamlit_app.py` as the entry point.
+5. Choose a memorable public subdomain and deploy. Optional API credentials
+   belong in Community Cloud **Advanced settings → Secrets**, never in Git.
+6. Test the public URL in a private/incognito browser window before submission.
+
+Streamlit installs the pinned dependencies in `requirements.txt`; the examiner
+only receives the public dashboard URL and the public GitHub repository URL.
 
 ## Public deployment and sharing
 

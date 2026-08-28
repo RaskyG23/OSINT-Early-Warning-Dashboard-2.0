@@ -23,6 +23,48 @@ HAZARD_EXPOSURE_TERMS = {
     "road", "bridge", "rail", "port", "airport", "terminal", "warehouse", "factory",
     "plant", "supplier", "cargo", "logistics", "power", "electricity", "utility", "telecoms",
 }
+TRADE_EXPOSURE_TERMS = {
+    "trade", "import", "imports", "export", "exports", "customs", "tariff", "tariffs",
+    "embargo", "sanction", "sanctions", "border", "aid", "supplies", "fuel", "commodity",
+    "commodities", "production", "supplier", "suppliers", "inventory",
+}
+UTILITY_EXPOSURE_TERMS = {
+    "power", "electricity", "grid", "transmission", "pipeline", "refinery", "utility", "utilities",
+}
+LITERAL_TRANSPORT_TERMS = MARITIME_TERMS | {
+    "airport", "airspace", "aircraft", "aviation", "airline", "flight", "runway", "airfreight",
+    "truck", "road", "bridge", "rail", "railway", "border", "customs",
+}
+METAPHORICAL_PATTERNS = (
+    r"\bwar on [‘'\"]?(?:drip pricing|prices?|pricing|poverty|drugs?|waste|inflation|disease|crime)\b",
+    r"\bfinancial closure\b",
+    r"\btsunami of (?:emigration|migration|applications|criticism|debt)\b",
+    r"\bflood of (?:applications|messages|complaints|people|money)\b",
+)
+STATEMENT_PATTERNS = (
+    r"\b(?:condemns?|comments?|discusses?|urges?|calls for|backs?|supports?)\b",
+)
+SUPPORT_CONTEXT_PATTERNS = (
+    r"\b(?:fight|fighting|campaign|programme|program|plan|response) against\b",
+    r"\b(?:backs?|supports?|funds?|assists?|helps?)\b.{0,45}\b(?:fight|response|recovery|resilience)\b",
+)
+ACTIVE_HAZARD_PATTERNS = (
+    r"\b(?:strikes?|hits?|damages?|disrupts?|closes?|blocks?|destroys?|forces?|threatens?)\b",
+    r"\b(?:warning|alert|high risk|severe|major|widespread|ongoing)\b",
+)
+
+# Small, auditable infrastructure/location gazetteer. It can be extended without
+# weakening the explicit-country rule because every mapping is unambiguous.
+ASSET_COUNTRIES = {
+    "ben gurion airport": "Israel", "heathrow airport": "United Kingdom",
+    "port of rotterdam": "Netherlands", "lagos port complex": "Nigeria",
+    "apapa port": "Nigeria", "suez canal": "Egypt", "gridco": "Ghana",
+}
+FOREIGN_PLACE_COUNTRIES = {
+    "kyiv": "Ukraine", "ukraine": "Ukraine", "kurdistan": "Iraq",
+    "gaza": "Palestine", "taiwan": "Taiwan", "maine": "United States",
+    "iran": "Iran", "somalia": "Somalia", "somali": "Somalia",
+}
 STRATEGIC_ROUTE_MARKERS = {
     "bab el-mandeb", "bab-el-mandeb", "red sea", "suez", "hormuz", "persian gulf", "gulf of aden",
     "black sea", "malacca", "panama canal", "english channel", "bosporus", "bosphorus",
@@ -67,6 +109,7 @@ COUNTRY_TEXT_ALIASES = {
     "United States of America": ("United States", "United States of America", "America", "USA", "U.S.A.", "US", "U.S."),
     "Netherlands": ("Netherlands", "The Netherlands", "Holland", "Dutch"),
     "United Arab Emirates": ("United Arab Emirates", "Emirati", "UAE", "U.A.E."),
+    "Iran": ("Iran", "Iranian"),
     "Russia": ("Russia", "Russian Federation", "Russian"),
     "Democratic Republic of the Congo": ("Democratic Republic of the Congo", "DR Congo", "DRC", "Congolese"),
     "Congo": ("Congo", "Republic of the Congo", "Congo-Brazzaville"),
@@ -160,37 +203,66 @@ def country_sentiment(text, country):
             "negative_hits": negative_hits, "method": "Country-targeted weighted lexicon"}
 
 
-def country_supply_chain_relevance(article, country):
+def country_supply_chain_relevance(article, country, relevance_threshold=60):
     """Score evidence that a story affects the selected country's operations."""
-    headline = article.get("headline", "")
+    # RSS headlines often end in " - Publisher". That suffix is provenance,
+    # not event content, and must not assign a story to the publisher's country.
+    headline = re.sub(r"\s+[\-–—]\s+[^\-–—]{2,80}$", "", article.get("headline", "")).strip()
     text = f'{headline} {article.get("summary", "")}'
     lowered = text.casefold()
     tokens = _tokens(text)
-    country_explicit = country_mentioned(headline, country)
-    transport = bool(tokens & (MARITIME_TERMS | AVIATION_TERMS | HAZARD_EXPOSURE_TERMS | {"truck", "border", "customs"}))
+    metaphorical = any(re.search(pattern, lowered) for pattern in METAPHORICAL_PATTERNS)
+    ambiguous_brand = country == "Poland" and "poland spring" in lowered
+    country_explicit = country_mentioned(headline, country) and not ambiguous_brand
+    inferred_assets = [asset for asset, mapped_country in ASSET_COUNTRIES.items()
+                       if mapped_country == country and asset in lowered]
+    country_identified = country_explicit or bool(inferred_assets)
+    foreign_places = [place for place, mapped_country in FOREIGN_PLACE_COUNTRIES.items()
+                      if mapped_country != country and place in lowered]
+    statement_only = bool(any(re.search(pattern, lowered) for pattern in STATEMENT_PATTERNS))
+    statement_only = statement_only and not bool(tokens & (OPERATIONAL_CONSEQUENCE_TERMS | LITERAL_TRANSPORT_TERMS))
+    actor_only = country_explicit and bool(foreign_places) and not inferred_assets
+    strategic = any(marker in lowered for marker in STRATEGIC_ROUTE_MARKERS)
+    transport = bool(tokens & (LITERAL_TRANSPORT_TERMS | HAZARD_EXPOSURE_TERMS))
+    broader_exposure = bool(tokens & (TRADE_EXPOSURE_TERMS | UTILITY_EXPOSURE_TERMS)) or strategic
     hazard = bool(tokens & NATURAL_HAZARD_TERMS)
-    operational = bool(tokens & (OPERATIONAL_CONSEQUENCE_TERMS | ARMED_THREAT_TERMS | NATURAL_HAZARD_TERMS))
+    active_hazard = hazard and any(re.search(pattern, lowered) for pattern in ACTIVE_HAZARD_PATTERNS)
+    support_context = any(re.search(pattern, lowered) for pattern in SUPPORT_CONTEXT_PATTERNS)
+    operational = bool(tokens & (OPERATIONAL_CONSEQUENCE_TERMS | ARMED_THREAT_TERMS)) or active_hazard
+    operational = operational and not metaphorical and not support_context
     primary = article.get("coverage_scope") == "Primary operational"
     local = article.get("coverage_scope") == "Local / regional"
-    strategic = any(marker in lowered for marker in STRATEGIC_ROUTE_MARKERS)
     score = (45 if country_explicit else 0) + (30 if operational else 0) + (20 if transport else 0)
+    score += 35 if inferred_assets and not country_explicit else 0
+    score += 20 if broader_exposure and not transport else 0
     score += 10 if primary else 5 if local else 0
     score += 5 if strategic else 0
     reasons = []
     if country_explicit: reasons.append("selected country or a controlled alias is explicitly identified")
+    if inferred_assets: reasons.append(f"country inferred from recognised infrastructure: {', '.join(inferred_assets)}")
     if operational: reasons.append("an operational threat or consequence is described")
     if transport: reasons.append("transport or logistics exposure is identified")
+    elif broader_exposure: reasons.append("trade, utility or humanitarian-logistics exposure is identified")
     if primary: reasons.append("reported by a primary operational source")
     # Primary/operational-source status strengthens evidence but cannot assign
     # an international story to a country that its publisher headline does not
     # identify. This prevents global LNG or nearby-country stories leaking into
     # unrelated briefs merely because they mention operational disruption.
-    country_identified = country_explicit
-    # A concrete natural hazard can be operationally important before a news
-    # report names a port or airport. Keep it when the selected country is
-    # explicit; the risk model still separates impact from evidential confidence.
-    relevant = score >= 60 and country_identified and operational and (transport or primary or hazard)
-    return {"score": min(100, score), "relevant": relevant, "reason": "; ".join(reasons) or "no direct operational connection identified"}
+    exposure = transport or broader_exposure or primary or active_hazard
+    evidence_gates = country_identified and operational and exposure
+    if metaphorical or statement_only or actor_only or support_context:
+        evidence_gates = False
+    display_score = min(100, score)
+    if metaphorical or statement_only or support_context:
+        display_score = min(display_score, 30)
+    elif actor_only:
+        display_score = min(display_score, 40)
+    relevant = display_score >= relevance_threshold and evidence_gates
+    return {"score": display_score, "relevant": relevant,
+            "reason": "; ".join(reasons) or "no direct operational connection identified",
+            "evidence_gates": evidence_gates, "country_inferred": bool(inferred_assets),
+            "metaphorical": metaphorical, "actor_only": actor_only,
+            "statement_only": statement_only, "threshold": relevance_threshold}
 
 
 def _signal_corroboration(signal, articles, country):
@@ -451,10 +523,9 @@ def assess_country(country, articles, signals=None, exposure=None, anomaly_score
     # explicitly reports the scoring-window size.
     assessed.sort(key=lambda item: item.get("published_at") or "", reverse=True)
     matching_signals = []
-    country_key = country.casefold()
     for signal in signals or []:
-        signal_place = f'{signal.get("country", "")} {signal.get("location", "")}'.casefold()
-        if country_key in signal_place:
+        signal_place = f'{signal.get("country", "")} {signal.get("location", "")}'
+        if country_mentioned(signal_place, country):
             matching_signals.append(signal)
     if not assessed:
         if matching_signals:

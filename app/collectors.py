@@ -18,7 +18,8 @@ import websocket
 from app.database import (flight_routes, recent_signals, record_country_refresh, record_run, upsert_aircraft_states,
                           upsert_articles, upsert_flight_route, upsert_signals, upsert_vessel_positions)
 from app.news_taxonomy import classify_general_news
-from app.patterns import analyze_observation, event_match, fact_variance, same_story, story_key
+from app.patterns import (analyze_observation, event_match, fact_variance, same_story,
+                          story_key, strip_publisher_suffix)
 from app.supply_chain import country_supply_chain_relevance, tone_assessment
 
 UTC = timezone.utc
@@ -73,6 +74,15 @@ SOURCE_COUNTRIES = {
     "news24": "South Africa", "vanguard": "Nigeria", "premium times": "Nigeria",
 }
 
+WIRE_FAMILIES = {
+    "reuters": "reuters", "associated press": "associated-press", "ap news": "associated-press",
+    "agence france-presse": "afp", "afp": "afp", "bloomberg": "bloomberg",
+}
+
+# These country-code domains are widely marketed internationally and therefore
+# do not provide reliable evidence of a publisher's editorial home country.
+GENERIC_CCTLDS = {"ai", "co", "fm", "io", "me", "tv", "ws"}
+
 # Direct organisational domains are searched separately from general news. These
 # records are labelled as primary evidence and remain distinguishable throughout
 # clustering, storage and confidence assessment.
@@ -105,6 +115,10 @@ OPERATIONAL_SOURCE_GROUPS = {
 
 
 def _source_family(publisher, source_url):
+    identity = f"{publisher or ''} {strip_publisher_suffix(publisher or '')}".casefold()
+    for marker, family in WIRE_FAMILIES.items():
+        if re.search(rf"\b{re.escape(marker)}\b", identity):
+            return family
     host = urlparse(source_url or "").netloc.lower().removeprefix("www.")
     if host:
         parts = host.split(".")
@@ -338,7 +352,7 @@ def _source_origin(publisher, source_url):
     host = urlparse(source_url or "").netloc.lower().split(":")[0]
     suffix = host.rsplit(".", 1)[-1].upper() if "." in host else ""
     suffix = "GB" if suffix == "UK" else suffix
-    if len(suffix) == 2:
+    if len(suffix) == 2 and suffix.casefold() not in GENERIC_CCTLDS:
         match = pycountry.countries.get(alpha_2=suffix)
         if match:
             return match.name
@@ -361,11 +375,27 @@ def _fact_variance(left_headline, right_headline):
     return fact_variance(left_headline, right_headline)
 
 
+def _published_within(left, right, days=7):
+    try:
+        a = datetime.fromisoformat((left or "").replace("Z", "+00:00"))
+        b = datetime.fromisoformat((right or "").replace("Z", "+00:00"))
+        return abs((a - b).total_seconds()) <= days * 86400
+    except (TypeError, ValueError):
+        return True
+
+
+def _same_event(left, right):
+    """Require semantic event agreement and temporal proximity."""
+    if not _published_within(left.get("published_at"), right.get("published_at")):
+        return False
+    return _event_match(left.get("headline", ""), right.get("headline", ""))
+
+
 def _cluster_stories(items, country, category):
     clusters = []
     for item in sorted(items, key=lambda row: row.get("published_at") or "", reverse=True):
         key = _story_key(item["headline"])
-        cluster = next((candidate for candidate in clusters if _same_story(key, candidate["key"])), None)
+        cluster = next((candidate for candidate in clusters if _same_event(item, candidate["items"][0])), None)
         if cluster:
             cluster["items"].append(item)
         else:
@@ -374,7 +404,8 @@ def _cluster_stories(items, country, category):
     for cluster in clusters:
         representative = cluster["items"][0].copy(); sources = []; seen = set()
         for item in cluster["items"]:
-            source_key = (item["publisher"] or "").lower()
+            source_key = item.get("source_family") or _source_family(
+                item.get("publisher"), item.get("source_home") or item.get("url"))
             if source_key in seen:
                 continue
             seen.add(source_key)
@@ -399,7 +430,13 @@ def _cluster_stories(items, country, category):
 
 def _headline_searches(article, collected):
     key = _story_key(article["headline"])
-    query = " ".join(key.split()[:14])
+    # Search the concrete event anchors, not an outlet's complete wording. This
+    # retrieves independently phrased reports while avoiding generic topic hits.
+    important = [word for word in key.split() if word not in {"live", "update", "news", "report"}]
+    query = " ".join(important[:10])
+    country = article.get("country") or ""
+    if country and country.casefold() not in query.casefold():
+        query = f'"{COUNTRY_ALIASES.get(country, country)}" {query}'
     if not query:
         return []
     encoded = quote_plus(query + " when:30d")
@@ -436,9 +473,8 @@ def _merge_story_sources(article, additions, country):
         source.get("source_family") or (source.get("publisher") or "").lower()
         for source in sources
     }
-    story_key = _story_key(article["headline"])
     for item in additions:
-        if not _event_match(article["headline"], item.get("headline", "")):
+        if not _same_event(article, item):
             continue
         family = item.get("source_family") or _source_family(item.get("publisher"), item.get("source_home") or item.get("url"))
         if not family or family in seen_families:
@@ -577,6 +613,8 @@ def collect_country(country, enrich=False):
             if item["url"] not in selected_urls:
                 articles.append(item); selected_urls.add(item["url"])
         articles = sorted(articles, key=lambda a: a.get("published_at") or "", reverse=True)[:5]
+        for article in articles:
+            article["country"] = country
         output[category] = articles
 
     enrichment = {(category, index): [] for category, articles in output.items() for index, _ in enumerate(articles)}

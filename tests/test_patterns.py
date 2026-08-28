@@ -4,8 +4,9 @@ import unittest
 from pathlib import Path
 
 from app import database
-from app.collectors import (_attach_hazard_signals, _fintraffic_items, _gfw_last_port, _hazard_kinds,
-                            ais_vessel_type)
+from app.collectors import (_attach_hazard_signals, _cluster_stories, _fintraffic_items,
+                            _gfw_last_port, _hazard_kinds, _merge_story_sources,
+                            _source_family, _source_origin, ais_vessel_type)
 from app.embeddings import train_ppmi_embeddings
 from app.patterns import (
     analyze_observation,
@@ -174,6 +175,50 @@ class PatternRecognitionTests(unittest.TestCase):
     def test_country_aliases_do_not_use_ambiguous_substrings(self):
         self.assertFalse(country_mentioned("The company said a turkey shipment was delayed", "Türkiye"))
         self.assertFalse(country_mentioned("The cargo vessel will congo through repairs", "Congo"))
+
+    def test_publisher_suffix_cannot_assign_story_to_publishers_country(self):
+        article = {
+            "headline": "Earthquake damages Indonesian port - Independent Newspaper Nigeria",
+            "summary": "Freight operations in Indonesia were suspended.",
+            "coverage_scope": "International",
+        }
+        self.assertFalse(country_supply_chain_relevance(article, "Nigeria")["relevant"])
+
+    def test_wire_republication_counts_as_one_source_family(self):
+        self.assertEqual(_source_family("Reuters", "https://reuters.com/a"), "reuters")
+        self.assertEqual(_source_family("Reuters report", "https://msn.com/a"), "reuters")
+
+    def test_generic_country_code_domain_does_not_claim_source_origin(self):
+        self.assertEqual(_source_origin("Example Network", "https://example.tv/story"), "Origin unverified")
+
+    def test_initial_cluster_uses_event_anchors_for_reworded_reports(self):
+        items = [{
+            "headline": "Missile attack closes Odesa cargo port",
+            "publisher": "Outlet One", "url": "https://one.test/a", "source_home": "https://one.test",
+            "source_family": "one.test", "coverage_scope": "International",
+            "source_type": "News reporting", "published_at": "2026-08-20T10:00:00+00:00", "description": "",
+        }, {
+            "headline": "Odesa port shut after missile strike disrupts freight",
+            "publisher": "Outlet Two", "url": "https://two.test/b", "source_home": "https://two.test",
+            "source_family": "two.test", "coverage_scope": "International",
+            "source_type": "News reporting", "published_at": "2026-08-20T11:00:00+00:00", "description": "",
+        }]
+        stories = _cluster_stories(items, "Ukraine", "Infrastructure and supply chains")
+        self.assertEqual(len(stories), 1)
+        self.assertEqual(len(json.loads(stories[0]["sources_json"])), 2)
+
+    def test_enrichment_rejects_old_recurring_incident(self):
+        article = {
+            "headline": "Missile attack closes Odesa cargo port", "published_at": "2026-08-20T10:00:00+00:00",
+            "summary": "Port operations stopped.", "sources_json": "[]", "coverage_scope": "International",
+        }
+        addition = {
+            "headline": "Missile attack closes Odesa cargo port", "published_at": "2026-07-01T10:00:00+00:00",
+            "publisher": "Old News", "url": "https://old.test/a", "source_home": "https://old.test",
+            "source_family": "old.test", "coverage_scope": "International",
+        }
+        result = _merge_story_sources(article, [addition], "Ukraine")
+        self.assertEqual(json.loads(result["sources_json"]), [])
 
     def test_zero_result_country_refresh_is_not_treated_as_fresh_cache(self):
         from datetime import datetime, timezone
@@ -533,6 +578,60 @@ class PatternRecognitionTests(unittest.TestCase):
                      "summary": "A primary operational bulletin.",
                      "coverage_scope": "Primary operational"}
         self.assertFalse(country_supply_chain_relevance(unrelated, "Libya")["relevant"])
+
+    def test_metaphorical_disruption_terms_do_not_pass_relevance_gate(self):
+        for headline in (
+            "All power to the UK watchdog's war on drip pricing",
+            "A tsunami of emigration reshapes Israel's future",
+            "Financial closure secured for India solar project",
+        ):
+            country = "United Kingdom" if "UK" in headline else "Israel" if "Israel" in headline else "India"
+            result = country_supply_chain_relevance(
+                {"headline": headline, "summary": "", "coverage_scope": "International"}, country)
+            self.assertFalse(result["relevant"], headline)
+
+    def test_country_as_commentator_or_foreign_actor_is_not_affected_country(self):
+        examples = (
+            ("Canada condemns drone attack in Kurdistan", "Canada"),
+            ("Russian missile barrage strikes Kyiv in Ukraine", "Russia"),
+            ("Somali piracy rises during the U.S.-Iran war", "United States"),
+        )
+        for headline, country in examples:
+            result = country_supply_chain_relevance(
+                {"headline": headline, "summary": "", "coverage_scope": "International"}, country)
+            self.assertFalse(result["relevant"], headline)
+
+    def test_military_threat_is_not_itself_commercial_aviation_exposure(self):
+        result = country_supply_chain_relevance({
+            "headline": "Germany opens drone research centre amid infrastructure threats",
+            "summary": "", "coverage_scope": "International",
+        }, "Germany")
+        self.assertFalse(result["relevant"])
+
+    def test_trade_and_humanitarian_logistics_are_valid_exposures(self):
+        for headline, country in (
+            ("United Arab Emirates suspends trade with Iran after missile fire", "Iran"),
+            ("Sudan Red Sea closure threatens critical aid supplies", "Sudan"),
+        ):
+            result = country_supply_chain_relevance(
+                {"headline": headline, "summary": "", "coverage_scope": "International"}, country)
+            self.assertTrue(result["relevant"], headline)
+
+    def test_recognised_infrastructure_can_supply_country_identity(self):
+        result = country_supply_chain_relevance({
+            "headline": "Strike brings Ben Gurion Airport to a halt",
+            "summary": "", "coverage_scope": "International",
+        }, "Israel")
+        self.assertTrue(result["relevant"])
+        self.assertTrue(result["country_inferred"])
+
+    def test_policy_support_for_hazard_is_not_an_active_disruption(self):
+        result = country_supply_chain_relevance({
+            "headline": "World Bank backs Nigeria's fight against drought and land degradation",
+            "summary": "", "coverage_scope": "International",
+        }, "Nigeria")
+        self.assertFalse(result["relevant"])
+        self.assertTrue(result["statement_only"])
 
     def test_tone_assessment_distinguishes_negative_and_positive_reporting(self):
         self.assertEqual(tone_assessment("Attack closes port and delays shipping")["label"], "Negative")

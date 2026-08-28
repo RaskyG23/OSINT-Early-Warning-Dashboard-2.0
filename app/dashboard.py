@@ -1,5 +1,6 @@
 import html
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -26,17 +27,20 @@ from app.recommender import article_key, rank_articles, recommendation_reason
 from app.embeddings import train_ppmi_embeddings
 from app.news_taxonomy import classify_general_news
 from app.supply_chain import (assess_article, assess_country, country_sentiment,
-                              country_supply_chain_relevance, set_embedding_model)
+                              country_mentioned, country_supply_chain_relevance,
+                              set_embedding_model)
 from app.transport import (active_records, age_minutes, flight_estimates, format_duration,
                            cargo_flight_assessment, country_relationship, likely_commercial_aircraft,
                            likely_commercial_vessel,
                            resolve_aircraft_click, resolve_vessel_click, route_path)
 from app.disasters import ALERT_COLOURS, HAZARD_LABELS, disaster_details
+from app.forecasting import forecast_country
 
 st.set_page_config(page_title="OSINT Early Warning Dashboard 2.0", page_icon="◉", layout="wide", initial_sidebar_state="expanded")
 init_db()
 
 RISK_COLORS = {"Critical":"#d9363e", "Moderate":"#e5b62f", "Low":"#27a66a"}
+HOST_MODE = os.getenv("OSINT_HOST_MODE", "Docker + Streamlit")
 
 st.markdown("""
 <style>
@@ -63,8 +67,11 @@ with st.sidebar:
                                    help="Use a different name for each person or role.")
     feedback_count = len(profile_feedback(active_profile.strip() or "Supply Chain Manager"))
     st.caption(f"{feedback_count} saved preference{'s' if feedback_count != 1 else ''}")
-    st.caption("Docker + Streamlit")
-    st.caption("Persistent SQLite storage")
+    st.caption(HOST_MODE)
+    if HOST_MODE == "Browser-hosted Streamlit":
+        st.caption("Examiner demo: SQLite history may reset after service restarts")
+    else:
+        st.caption("Persistent SQLite storage")
 
 if "collected" not in st.session_state:
     st.session_state.collected = False
@@ -175,13 +182,13 @@ def consolidated_country_stories(rows, country):
     return sorted(stories, key=article_datetime, reverse=True)
 
 
-def country_decision_candidates(rows, country, limit=15):
+def country_decision_candidates(rows, country, limit=15, max_age_days=7, allow_context_fallback=False):
     """Return a recent operational candidate pool, excluding incidental mentions."""
     # The current-risk surface must not reuse old SQLite rows indefinitely.
     # Reports older than seven days remain available to the Historical trend,
     # but cannot classify a country's present operational state as Moderate or
     # Critical.
-    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
     relevant = [
         row for row in rows
         if article_datetime(row) >= cutoff
@@ -206,15 +213,33 @@ def country_decision_candidates(rows, country, limit=15):
         return risk["level"] in {"Moderate", "Critical"} or operational_evidence or supported_hazard
 
     # Exclude political/general mentions that happen to contain the country
-    # name but provide no supply-chain consequence. Do not backfill with noise
-    # merely to force a five-item list.
+    # name but provide no supply-chain consequence from operational scoring.
     decision_updates = [story for story in consolidated if decision_relevant(story)]
+    if allow_context_fallback and len(decision_updates) < limit:
+        # The readable brief may use remaining country-verified, supply-chain
+        # context to fill its five stakeholder slots. This fallback is never
+        # enabled for the seven-day country-risk scoring window.
+        selected_ids = {story.get("story_key") or story.get("url") or story.get("headline") for story in decision_updates}
+        for story in consolidated:
+            identity = story.get("story_key") or story.get("url") or story.get("headline")
+            if identity in selected_ids:
+                continue
+            decision_updates.append(story)
+            selected_ids.add(identity)
+            if len(decision_updates) >= limit:
+                break
     return sorted(decision_updates, key=article_datetime, reverse=True)[:limit]
 
 
 def selected_country_updates(rows, country, feedback_rows=None, limit=5):
     """Select a personalised operational set, then present it in time order."""
-    candidates = country_decision_candidates(rows, country, max(limit * 3, 15))
+    # The stakeholder brief mirrors the collectors' rolling 30-day window so
+    # it can still present the latest qualifying context when a country has no
+    # event in the much stricter seven-day risk window. These older display
+    # items never enter the current country-risk calculation below.
+    candidates = country_decision_candidates(
+        rows, country, max(limit * 3, 15), max_age_days=30, allow_context_fallback=True
+    )
     selected = rank_articles(candidates, feedback_rows or [])[:limit]
     selected.sort(key=article_datetime, reverse=True)
     return selected
@@ -227,7 +252,7 @@ def canonical_country_updates(rows, country, limit=5):
 
 def latest_country_scoring_events(rows, country, limit=10):
     """Latest distinct operational events used by risk, independent of interests."""
-    return country_decision_candidates(rows, country, limit)[:limit]
+    return country_decision_candidates(rows, country, limit, max_age_days=7)[:limit]
 
 
 def render_article(row, priority_label=False, historical_matches=0, show_action=True,
@@ -290,7 +315,6 @@ def render_article(row, priority_label=False, historical_matches=0, show_action=
         hazard_evidence = (f'<div class="riskbox" style="background:{colour}10;border-left:3px solid {colour}">'
                            f'<b style="color:{colour}">{status}</b><br>{detail}</div>')
     provisional_note = f'<div class="riskbox" style="background:#fff8e8;border-left:3px solid #e5b62f"><b>PROVISIONAL ASSESSMENT</b><br>{article_risk["provisional_reason"]}</div>' if article_risk.get("provisional") else ""
-    exposure_note = f'<div class="riskbox" style="background:#f5f8fc"><b>RISK BASIS</b><br>{article_risk.get("exposure_basis") or "General operational monitoring"}' + (f'<br>Strategic route: {", ".join(article_risk.get("strategic_routes", []))}' if article_risk.get("strategic_routes") else '') + '</div>'
     connection = article_risk.get("operational_connection") or {}
     connection_note = ""
     if connection:
@@ -308,20 +332,11 @@ def render_article(row, priority_label=False, historical_matches=0, show_action=
                            f'<b style="color:{connection_colour}">OPERATIONAL CONNECTION · {connection.get("strength", "Weak")} {connection.get("score", 0)}/100</b><br>'
                            f'{detail}<br><b>Assets:</b> {assets}<br><b>Locations/routes:</b> {locations}<br>'
                            f'<b>Consequences:</b> {consequences}<br><b>Status:</b> {connection.get("lifecycle", "Unconfirmed")}<br>{gate}</div>')
-    semantic = article_risk.get("semantic_scores") or {}
-    semantic_note = ""
-    if semantic.get("trained"):
-        semantic_note = (f'<div class="riskbox" style="background:#f5f8fc"><b>SEMANTIC ASSOCIATION</b><br>'
-                         f'Corpus-trained PPMI embedding · risk contribution +{article_risk.get("semantic_bonus", 0)} points · '
-                         f'text coverage {round(float(semantic.get("coverage", 0)) * 100)}%</div>')
-    sentiment = article_risk.get("country_sentiment") or country_sentiment(
-        f'{row.get("headline", "")} {row.get("summary", "")}', row.get("country", ""))
-    relevance_note = f'<div class="riskbox" style="background:#f5f8fc"><b>COUNTRY RELEVANCE</b><br>{row.get("country_relevance_reason") or "Selected-country operational relevance verified during collection."}<br><b>Sentiment toward {sentiment["target"]}:</b> {sentiment["label"]} ({sentiment["score"]:+}/100)</div>'
     action = f'<div class="riskbox" style="background:#f7f9fc"><b>RECOMMENDED ACTION</b><br>{suggested_action(article_risk, historical_matches)}</div>' if show_action else ""
     st.markdown(f'''<div class="article">{priority}{recommendation}{published}<h4>{row["headline"]}</h4>
       <div class="sum"><b>✦ AUTOMATED SUMMARY</b><br>{row["summary"]}</div>
       <div class="riskbox" style="background:{risk_color}10;border-left:3px solid {risk_color}"><b style="color:{risk_color}">{article_risk["level"]} supply-chain risk · {article_risk["mode"]}</b><br>Impact score {article_risk["score"]}/100 · Confidence {article_risk["confidence"]}% (range {article_risk["confidence_low"]}–{article_risk["confidence_high"]}%)<ul>{effects}</ul></div>
-      {hazard_evidence}{connection_note}{exposure_note}{semantic_note}{relevance_note}{provisional_note}{action}<div class="source-list">{corroboration}<br><b style="font-size:9px">DISCOVERED MATCHING SOURCES · {len(reporting_sources)}</b><br>{source_links}</div>
+      {hazard_evidence}{connection_note}{provisional_note}{action}<div class="source-list">{corroboration}<br><b style="font-size:9px">DISCOVERED MATCHING SOURCES · {len(reporting_sources)}</b><br>{source_links}</div>
       <footer>{row.get("category", "Uncategorised").upper()} · {row.get("coverage_scope", "International").upper()} COVERAGE</footer></div>''', unsafe_allow_html=True)
     if profile and show_recommendation:
         key = article_key(row)
@@ -404,8 +419,13 @@ if not st.session_state.collected:
     st.session_state.collected = True
 
 
-def map_refresh_targets(signal_rows, stored_rows, exposure_countries, limit=40):
-    """Prioritise countries whose map risk can change without a user click."""
+def map_refresh_targets(signal_rows, stored_rows, exposure_countries):
+    """Return every country with current evidence that can change map risk.
+
+    The former fixed limit left some evidenced countries stale until their
+    briefs were opened.  Restricting stored rows to the seven-day scoring
+    window keeps this refresh bounded without arbitrarily dropping countries.
+    """
     priority = {}
     selected = st.session_state.get("country")
     if selected in COUNTRY_NAMES:
@@ -414,23 +434,27 @@ def map_refresh_targets(signal_rows, stored_rows, exposure_countries, limit=40):
         if country in COUNTRY_NAMES:
             priority[country] = max(priority.get(country, 0), 800)
     severity_priority = {"Critical": 750, "High": 650, "Watch": 550}
-    names_by_fold = {name.casefold(): name for name in COUNTRY_NAMES}
     for signal in signal_rows:
-        raw_country = str(signal.get("country") or "").strip().casefold()
-        match = names_by_fold.get(raw_country)
-        if not match and raw_country:
-            match = next((name for name in COUNTRY_NAMES if name.casefold() in raw_country), None)
+        signal_place = f'{signal.get("country", "")} {signal.get("location", "")}'.strip()
+        # Feed geography is not standardised: examples include "Russian
+        # Federation", "Moscow, ..., Russia", "USA" and official UN-style
+        # names. Use the same controlled alias rules as country intelligence,
+        # preferring the most specific matching country when several names are
+        # present (for example Georgia, United States).
+        matches = [name for name in COUNTRY_NAMES if country_mentioned(signal_place, name)]
+        match = max(matches, key=len) if matches else None
         if match:
             priority[match] = max(priority.get(match, 0), severity_priority.get(signal.get("severity"), 500))
     # Countries already represented by fresh operational articles must also be
     # refreshed; otherwise their colour can remain stale until clicked.
+    scoring_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     for row in stored_rows:
         country = row.get("country")
-        if country in COUNTRY_NAMES:
+        if country in COUNTRY_NAMES and article_datetime(row) >= scoring_cutoff:
             article_priority = 400 + min(100, assess_article(row).get("score", 0))
             priority[country] = max(priority.get(country, 0), article_priority)
     ordered = sorted(priority, key=lambda country: (-priority[country], country))
-    return ordered[:limit]
+    return ordered
 
 
 if refresh:
@@ -460,8 +484,8 @@ stored_articles = all_country_articles()
 map_refresh_notice = st.session_state.pop("map_refresh_notice", None)
 if map_refresh_notice:
     st.success(
-        f'Map risk refreshed before selection: {map_refresh_notice["countries"]} countries checked and '
-        f'{map_refresh_notice["articles"]} current operational reports stored. Country colours below use this new snapshot.'
+        f'Map risk refreshed before selection: {map_refresh_notice["countries"]} countries with current evidence checked and '
+        f'{map_refresh_notice["articles"]} operational reports stored. All country colours below were then recalculated.'
     )
 
 
@@ -1180,12 +1204,12 @@ def show_country_intelligence(country):
             f'The confidence percentage describes evidence quality; it is not the operational risk score.</p></div>',
             unsafe_allow_html=True,
         )
-    current_tab, historical_tab = st.tabs(["Current trend", "Historical trend"])
+    current_tab, historical_tab, forecast_tab = st.tabs(["Current trend", "Historical trend", "Forecast"])
     historical_keys = [headline_tokens(row.get("headline", "")) for row in history]
     with current_tab:
         if refresh_failed:
             st.warning("Live sources returned no new country articles. Stored reporting is shown where still current; try updating again later.")
-        st.caption(f'Five current country-specific updates are displayed newest first. The country score uses {assessment.get("scoring_window_size", len(scoring_events))} latest distinct operational events with 10% exponential recency decay.')
+        st.caption(f'Up to five latest qualifying country-specific updates from the 30-day reporting window are displayed newest first. The current country score separately uses {assessment.get("scoring_window_size", len(scoring_events))} distinct operational events from the latest seven days with 10% exponential recency decay.')
         if not current:
             st.info("No current supply-chain reporting was returned for this country.")
         for row in current:
@@ -1206,6 +1230,59 @@ def show_country_intelligence(country):
         for row in history:
             row["summary"] = row.get("summary") or f'{row.get("publisher") or "A reporting source"} reported: {row["headline"]}.'
             render_article(row, show_action=False)
+    with forecast_tab:
+        forecast = forecast_country(country, scoring_events, assessment)
+        st.caption(
+            "Short-horizon projection of the dashboard’s operational-risk indicator from fresh country news. "
+            "It is a decision-support scenario, not a claim that a particular event will occur."
+        )
+        if not forecast["available"]:
+            st.info(forecast["reason"])
+            st.markdown(
+                "**What is needed:** at least one fresh qualifying operational event; multiple dated and "
+                "corroborated events produce a more defensible direction and uncertainty range."
+            )
+        else:
+            direction_colour = "#a3212b" if forecast["direction"] == "Escalating" else "#177554" if forecast["direction"] == "Easing" else "#4c607a"
+            st.markdown(
+                f'<div class="brief"><b style="color:{direction_colour}">{forecast["direction"].upper()}</b>'
+                f'<p>{forecast["method"]} estimates a change of {forecast["slope"]:+.2f} risk-score points per day. '
+                f'Forecast confidence: {forecast["confidence"]}% · evidence: {forecast["evidence_count"]} fresh events, '
+                f'{forecast["corroborated_count"]} corroborated or primary-source supported.</p></div>',
+                unsafe_allow_html=True,
+            )
+            columns = st.columns(len(forecast["projections"]))
+            for column, projection in zip(columns, forecast["projections"]):
+                colour = RISK_COLORS[projection["level"]]
+                column.markdown(
+                    f'<div class="metric"><span>NEXT {projection["days"]} DAYS</span>'
+                    f'<b style="color:{colour}">{projection["score"]}/100</b>'
+                    f'<small>{projection["level"]} · indicative range {projection["low"]}–{projection["high"]}</small></div>',
+                    unsafe_allow_html=True,
+                )
+            if forecast.get("scenarios"):
+                st.markdown("#### Possible operational outcomes")
+                st.caption("These are evidence-derived scenarios to monitor, not predicted facts.")
+                for scenario in forecast["scenarios"]:
+                    st.markdown(
+                        f'- {scenario["outcome"].capitalize()} '
+                        f'— supported by {scenario["supporting_events"]} recent event'
+                        f'{"s" if scenario["supporting_events"] != 1 else ""}.'
+                    )
+            st.markdown("#### Evidence driving the projection")
+            for driver in forecast["drivers"]:
+                driver_time = format_article_time(driver.get("published_at") or driver.get("collected_at"))
+                st.markdown(
+                    f'<div class="event">{driver_time}<b>{html.escape(driver.get("headline") or "Operational update")}</b>'
+                    f'<p>Article impact {driver["risk"]["score"]}/100 · {driver["risk"]["level"]} · '
+                    f'{driver["risk"].get("source_count", 0)} independent source families</p></div>',
+                    unsafe_allow_html=True,
+                )
+            st.markdown(f'**Suggested preparation:** {forecast["action"]}')
+            st.caption(
+                f'Model residual error: {forecast["rmse"]:.2f} score points. The displayed range is an '
+                'uncertainty indicator and is not a calibrated probability interval.'
+            )
 
 
 # Feedback buttons inside a dialog cause Streamlit to rerun the script. Reopen
@@ -1282,7 +1359,7 @@ def render_general_news_panel():
 
 map_col, news_col = st.columns([3, 1], gap="large")
 with map_col:
-    st.markdown('''<div class="panel"><h3 style="margin:0">Global supply-chain intelligence map</h3><p class="subtitle">Hover to identify a country. Click anywhere inside a country to open its current and historical supply-chain intelligence.</p><div class="legend"><span><i style="background:#27a66a"></i>Low</span><span><i style="background:#e5b62f"></i>Moderate</span><span><i style="background:#d9363e"></i>Critical</span></div></div>''', unsafe_allow_html=True)
+    st.markdown('''<div class="panel"><h3 style="margin:0">Global supply-chain intelligence map</h3><p class="subtitle">Hover to identify a country. Click anywhere inside a country to open its current and historical supply-chain intelligence. Colours show the latest recalculated operational-risk band.</p><div class="legend"><span><i style="background:#27a66a"></i>Low</span><span><i style="background:#e5b62f"></i>Moderate</span><span><i style="background:#d9363e"></i>Critical</span></div></div>''', unsafe_allow_html=True)
     selector_col, open_col = st.columns([5, 1])
     with selector_col:
         selected_country = st.selectbox("Search for a country", COUNTRY_NAMES, index=None,
@@ -1299,15 +1376,17 @@ with map_col:
         st.session_state.open_country_brief = selected_country
         st.rerun()
 
+    map_status = {name: country_risks[name]["level"] for _, name in COUNTRIES}
+    map_values = {"Low": 0, "Moderate": 1, "Critical": 2}
     fig = go.Figure(go.Choropleth(
         locations=[code for code, _ in COUNTRIES], locationmode="ISO-3",
-        z=[{"Low": 0, "Moderate": 1, "Critical": 2}[country_risks[name]["level"]] for _, name in COUNTRIES],
-        customdata=[[name, country_risks[name]["level"], country_risks[name]["score"], country_risks[name]["confidence"]]
-                    for _, name in COUNTRIES], zmin=0, zmax=2,
-        colorscale=[[0, "#27a66a"], [0.4999, "#27a66a"], [0.5, "#e5b62f"],
+        z=[map_values[map_status[name]] for _, name in COUNTRIES],
+        customdata=[[name, map_status[name], country_risks[name]["score"], country_risks[name]["confidence"],
+                     country_risks[name].get("evidence_count", 0)] for _, name in COUNTRIES], zmin=0, zmax=2,
+        colorscale=[[0, "#27a66a"], [0.2499, "#27a66a"], [0.25, "#e5b62f"],
                     [0.7499, "#e5b62f"], [0.75, "#d9363e"], [1, "#d9363e"]],
         showscale=False, marker_line_color="#8faab4", marker_line_width=0.6,
-        hovertemplate="<b>%{customdata[0]}</b><br>%{customdata[1]} risk · %{customdata[2]}/100<br>Confidence %{customdata[3]}%<br>Click for intelligence<extra></extra>",
+        hovertemplate="<b>%{customdata[0]}</b><br>%{customdata[1]} · score %{customdata[2]}/100<br>Confidence %{customdata[3]}% · %{customdata[4]} fresh evidence items<br>Click for intelligence<extra></extra>",
     ))
     fig.update_geos(showcountries=True, countrycolor="#91aab2", showcoastlines=True,
         coastlinecolor="#89a6b2", showland=True, landcolor="#dce8e8", showocean=True, oceancolor="#d8edf3",
