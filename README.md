@@ -6,7 +6,7 @@ Streamlit application and as a reproducible local Docker application.
 ## Examiner quick access (no installation)
 
 The recommended examination route is the public Streamlit Community Cloud
-deployment. The examiner opens the supplied `streamlit.app` link in a modern
+deployment: <https://osint-early-warning-dashboard-20.streamlit.app/>. The examiner opens this link in a modern
 web browser; no Docker, Python, GitHub account, ChatGPT account or project
 download is required. The repository remains public so source files,
 evaluation data and documentation can also be inspected online.
@@ -23,7 +23,8 @@ local history is required.
 2. Sign in at <https://share.streamlit.io> with GitHub and select **Create app**.
 3. Choose repository `RaskyG23/OSINT-Early-Warning-Dashboard-2.0`.
 4. Select the deployment branch and enter `streamlit_app.py` as the entry point.
-5. Choose a memorable public subdomain and deploy. Optional API credentials
+5. Choose a memorable public subdomain and deploy. This project currently uses
+   `osint-early-warning-dashboard-20`. Optional API credentials
    belong in Community Cloud **Advanced settings → Secrets**, never in Git.
 6. Test the public URL in a private/incognito browser window before submission.
 

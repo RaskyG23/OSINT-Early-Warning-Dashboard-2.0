@@ -169,15 +169,25 @@ def collect_gdacs():
     rows_by_id = {}; failures = []
     # Query each type independently. A combined request is dominated by common
     # earthquakes and wildfires and can omit sparse cyclones or volcanoes.
-    for requested_type in event_types:
+    def fetch_type(requested_type):
         try:
             response = SESSION.get(url, params={
                 "eventlist": requested_type, "alertlevel": "Green;Orange;Red", "pagesize": 100,
             }, timeout=20)
             response.raise_for_status()
-            data = response.json()
+            return requested_type, response.json(), None
         except Exception as exc:
-            failures.append(f"{requested_type}: {exc}")
+            return requested_type, None, exc
+
+    # GDACS hazard types are independent API queries. Running them together
+    # prevents a single slow type from making cloud startup wait up to two
+    # minutes before Streamlit can draw the interface.
+    with ThreadPoolExecutor(max_workers=len(event_types)) as executor:
+        responses = list(executor.map(fetch_type, event_types))
+
+    for requested_type, data, error in responses:
+        if error is not None:
+            failures.append(f"{requested_type}: {error}")
             continue
         for item in data.get("features", []):
             if not isinstance(item, dict) or item.get("geometry", {}).get("type") != "Point":
@@ -749,7 +759,20 @@ def collect_general_news(country, limit=10):
 
 
 def collect_all():
-    return {"GDELT": collect_gdelt(), "GDACS": collect_gdacs(), "USGS": collect_usgs()}
+    collectors = {"GDELT": collect_gdelt, "GDACS": collect_gdacs, "USGS": collect_usgs}
+    results = {}
+    # Providers are independent. Concurrent collection makes first load depend
+    # on the slowest provider rather than the sum of all provider durations.
+    with ThreadPoolExecutor(max_workers=len(collectors)) as executor:
+        futures = {executor.submit(collector): name for name, collector in collectors.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:
+                record_run(name, "unavailable", 0, str(exc), now_iso())
+                results[name] = []
+    return results
 
 
 AIS_MONITORING_ZONES = [

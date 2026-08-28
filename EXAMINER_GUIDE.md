@@ -2,7 +2,7 @@
 
 ## Recommended route: browser only
 
-Open the public Streamlit dashboard link supplied with the submission. No
+Open <https://osint-early-warning-dashboard-20.streamlit.app/>. No
 Docker, Python, GitHub account, ChatGPT account, plug-in or local project
 download is required.
 
@@ -13,6 +13,8 @@ code or the documented analytical methods.
 ## View the associated files online
 
 The public GitHub repository can be inspected in a browser:
+
+<https://github.com/RaskyG23/OSINT-Early-Warning-Dashboard-2.0>
 
 - `README.md` explains the architecture, data sources and dashboard controls.
 - `app/collectors.py` contains public-source ingestion and source consolidation.
